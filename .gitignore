@@ -1,0 +1,46 @@
+# Data files (large, generated)
+data/kcd/
+data/synthetic/
+data/cellml/
+data/processed/
+data/cache/
+kcd_preprocessed/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyd
+*.so
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Experiment outputs
+wandb/
+lightning_logs/
+checkpoints/
+outputs/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pytest
+.pytest_cache/
+
+# Myokit temp
+C_tmp_mk/

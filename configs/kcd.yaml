@@ -1,0 +1,30 @@
+kcd:
+  physionet_url: "https://physionet.org/content/kiel-cardio/1.0.0/"
+  database_name: "kiel-cardio/1.0.0"
+  data_dir: "data/kcd"
+  n_subjects: 7
+  n_trials_per_subject: 25
+  n_channels: 8
+  n_sensors: 4
+  axes_per_sensor: 2
+  variant: "preprocessed"
+
+  sensor_positions_cm:
+    - [0.0, 0.0, 0.0]
+    - [-3.0, 0.0, 3.0]
+    - [-3.0, 0.0, 0.0]
+    - [0.0, 0.0, 3.0]
+
+  array_grid:
+    x_offsets_cm: [-12.0, -9.0, -6.0, -3.0, 0.0]
+    z_offsets_cm: [0.0, 3.0, 6.0, 9.0, 12.0]
+
+  preprocessing:
+    beat_min_distance_ms: 400
+    beat_max_distance_ms: 2000
+    beat_window_pre_ms: 200
+    beat_window_post_ms: 400
+
+  noise_model:
+    n_noise_segments_per_record: 20
+    output_path: "data/processed/noise_model.json"

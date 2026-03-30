@@ -1,0 +1,44 @@
+model:
+  architecture: "A"
+  grid_size: 32
+  n_geometry_channels: 4
+  n_current_channels: 3
+  n_fno_layers: 3
+  n_fno_modes: 16
+  n_fno_hidden: 64
+  latent_dim: 512
+  decoder_base_channels: 512
+  n_decoder_upsamples: 3
+
+training:
+  phase1_epochs: 200
+  phase2_epochs: 150
+  batch_size: 16
+  lr_init: 1.0e-3
+  lr_final: 1.0e-5
+  lr_warmup_steps: 500
+  grad_clip_norm: 1.0
+  lambda_physics_init: 0.01
+  lambda_physics_final: 0.1
+  lambda_physics_doubling_epochs: 20
+  lambda_kl_init: 0.001
+  lambda_consistency_start_epoch: 10
+  lambda_consistency: 0.1
+  n_collocation_points: 1024
+
+data:
+  synthetic_dir: "data/synthetic"
+  processed_dir: "data/processed"
+  kcd_dir: "data/kcd"
+  train_fraction: 0.8
+  val_fraction: 0.1
+  test_fraction: 0.1
+  num_workers: 0
+  pin_memory: true
+
+evaluation:
+  n_uq_samples: 50
+  forward_l2_threshold: 0.08
+  physics_residual_threshold: 0.05
+  reconstruction_r_threshold: 0.85
+  uq_coverage_target: 0.95
