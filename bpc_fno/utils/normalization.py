@@ -40,14 +40,21 @@ class Normalizer:
     def fit(self, data_dir: str | Path) -> None:
         """Compute per-channel mean and std from training-split HDF5 files.
 
+        **J_i statistics** are computed from *active voxels only* (top 5%
+        by magnitude at the peak activation timestep).  This avoids the
+        problem where ~95% resting-tissue voxels (near zero) dominate
+        the statistics and produce a tiny std, causing normalized values
+        to explode to [-50, +50].
+
+        **B statistics** use all values (no masking needed).
+
         The method walks *data_dir* for ``*.h5`` / ``*.hdf5`` files.  A
         sample belongs to the training split when its zero-based index
         (in sorted filename order) satisfies ``idx % 10 in {0..7}``.
 
         Expected HDF5 dataset layout per file:
-        * ``J_i``  — shape ``(X, Y, Z, 3)`` (3 current-density components)
-        * ``B_mig`` — shape ``(S, 3)`` or ``(S, C)`` (sensor * component
-          channels, flattened to a single channel axis)
+        * ``J_i``  -- shape ``(T, N, N, N, 3)``
+        * ``B_mig`` -- shape ``(T, S, 3)``
 
         Parameters
         ----------
@@ -72,21 +79,21 @@ class Normalizer:
             len(h5_files),
         )
 
-        # -- J_i statistics (Welford online per-channel) --
+        # -- J_i statistics (Welford online per-channel, ACTIVE VOXELS ONLY) --
+        # We use the peak activation timestep per file (argmax of total
+        # |J_i|), then mask to top 5% by magnitude.  This matches what
+        # __getitem__ returns and avoids resting-tissue contamination.
         j_n: int = 0
         j_mean = np.zeros(3, dtype=np.float64)
         j_m2 = np.zeros(3, dtype=np.float64)
 
-        # -- B statistics --
+        # -- B statistics (all values, 10 subsampled timesteps) --
         b_n: int = 0
         b_mean: np.ndarray | None = None
         b_m2: np.ndarray | None = None
         b_channels: int | None = None
 
-        # Subsample timesteps to avoid reading hundreds of GB.
-        # 10 evenly-spaced timesteps per file captures the full dynamic
-        # range (rest, upstroke, plateau, repol) while being 200x faster.
-        n_time_samples = 10
+        n_time_samples = 10  # for B subsampling
 
         for file_idx, fpath in enumerate(train_files):
             if file_idx % 200 == 0:
@@ -100,30 +107,45 @@ class Normalizer:
                 logger.warning("Skipping corrupted file: %s", fpath)
                 continue
             with hf:
-                # --- J_i ---
+                # --- J_i (peak timestep, active voxels only) ---
                 if "J_i" in hf:
                     ds = hf["J_i"]
-                    T_total = ds.shape[0]
-                    # Pick evenly-spaced timesteps
-                    t_indices = np.linspace(
-                        0, T_total - 1, n_time_samples, dtype=int
-                    )
-                    j_data = np.asarray(
-                        ds[t_indices], dtype=np.float64
-                    )  # (n_time_samples, N, N, N, 3)
-                    j_flat = j_data.reshape(-1, j_data.shape[-1])
-                    for c in range(j_flat.shape[1]):
-                        col = j_flat[:, c]
-                        count = col.shape[0]
-                        batch_mean = col.mean()
-                        batch_var = col.var()
-                        new_n = j_n + count
-                        delta = batch_mean - j_mean[c]
-                        j_mean[c] += delta * count / new_n
-                        j_m2[c] += batch_var * count + delta ** 2 * j_n * count / new_n
-                    j_n += j_flat.shape[0]
+                    j_all = np.asarray(ds, dtype=np.float64)  # (T, N, N, N, 3)
 
-                # --- B_mig ---
+                    # Select peak activation timestep
+                    activity = np.abs(j_all).sum(axis=(1, 2, 3, 4))  # (T,)
+                    t_peak = int(np.argmax(activity))
+                    j_peak = j_all[t_peak]  # (N, N, N, 3)
+
+                    # Compute magnitude per voxel: (N, N, N)
+                    j_mag = np.linalg.norm(j_peak, axis=-1)
+
+                    # Find 95th percentile threshold (top 5% captures
+                    # the true wavefront without resting-tissue dilution)
+                    threshold = np.percentile(j_mag, 95)
+
+                    # Mask: active voxels = top 5% by magnitude
+                    active_mask = j_mag > threshold  # (N, N, N)
+
+                    # Collect J values at masked positions
+                    active_j = j_peak[active_mask]  # (n_active, 3)
+
+                    if active_j.shape[0] > 0:
+                        for c in range(3):
+                            col = active_j[:, c]
+                            count = col.shape[0]
+                            batch_mean = col.mean()
+                            batch_var = col.var()
+                            new_n = j_n + count
+                            delta = batch_mean - j_mean[c]
+                            j_mean[c] += delta * count / new_n
+                            j_m2[c] += (
+                                batch_var * count
+                                + delta ** 2 * j_n * count / new_n
+                            )
+                        j_n += active_j.shape[0]
+
+                # --- B_mig (all values) ---
                 if "B_mig" in hf:
                     ds_b = hf["B_mig"]
                     T_total_b = ds_b.shape[0]
@@ -155,18 +177,37 @@ class Normalizer:
                         new_n = b_n + count
                         delta = batch_mean - b_mean[c]
                         b_mean[c] += delta * count / new_n
-                        b_m2[c] += batch_var * count + delta ** 2 * b_n * count / new_n
+                        b_m2[c] += (
+                            batch_var * count
+                            + delta ** 2 * b_n * count / new_n
+                        )
                     b_n += b_flat.shape[0]
 
         # Finalise
         if j_n == 0:
             raise RuntimeError("No J_i data found in training files.")
 
-        j_std = np.sqrt(j_m2 / j_n)
+        j_std_raw = np.sqrt(j_m2 / j_n)
+
+        # J_i is a 3D vector field: components with smaller dynamic range
+        # (e.g. J_x) should still use the same normalisation scale so that
+        # the model treats the vector uniformly.  We enforce a floor equal
+        # to the largest per-component std.
+        j_std_floor = j_std_raw.max()
+        j_std = np.maximum(j_std_raw, j_std_floor)
         j_std = np.where(j_std < self._EPS, 1.0, j_std)
 
         self.stats["J_i_mean"] = j_mean.tolist()
         self.stats["J_i_std"] = j_std.tolist()
+
+        logger.info(
+            "J_i active-voxel stats: mean=%s, raw_std=%s, shared_std=%s "
+            "(from %d active voxels at peak timestep)",
+            [f"{v:.6e}" for v in j_mean],
+            [f"{v:.6e}" for v in j_std_raw],
+            [f"{v:.6e}" for v in j_std],
+            j_n,
+        )
 
         if b_n > 0 and b_mean is not None and b_m2 is not None:
             b_std = np.sqrt(b_m2 / b_n)

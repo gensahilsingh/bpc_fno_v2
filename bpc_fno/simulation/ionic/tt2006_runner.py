@@ -108,6 +108,12 @@ class TT2006Runner:
             getattr(ionic_cfg, "n_prepacing_beats", 10)
         )
 
+        # Persistent simulation cache: one compiled Simulation per cell type.
+        # Reused across run_single() calls via sim.reset() + set_constant().
+        # This avoids Myokit recompilation (and WinError 206 on Windows).
+        self._sim_cache: dict[str, Any] = {}  # cell_type -> myokit.Simulation
+        self._default_constants: dict[str, dict[str, float]] = {}  # cell_type -> {qname: default_value}
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -144,116 +150,109 @@ class TT2006Runner:
     # Public API
     # ------------------------------------------------------------------
 
+    def _get_or_create_sim(self, cell_type: str) -> Any:
+        """Get a persistent Simulation for this cell type, creating once.
+
+        The Simulation is compiled once and then reused via reset() +
+        set_constant() for each new parameter set.  This avoids
+        recompilation (and WinError 206 on Windows).
+        """
+        import myokit
+
+        if cell_type in self._sim_cache:
+            return self._sim_cache[cell_type]
+
+        model = self._loader.get_model(cell_type)
+        model = model.clone()
+
+        # Bind stimulus to pace protocol
+        stim_name = _find_variable_by_suffix(model, "i_Stim")
+        if stim_name is not None:
+            model.get(stim_name).set_binding("pace")
+
+        # Use a standard protocol — CL will be changed via set_constant
+        protocol = myokit.pacing.blocktrain(
+            period=1000, duration=_STIM_DURATION_MS,
+            offset=10, level=_STIM_LEVEL,
+        )
+
+        sim = myokit.Simulation(model, protocol)
+
+        # Cache the default constant values for parameter scaling
+        defaults: dict[str, float] = {}
+        for var in model.variables(deep=True):
+            try:
+                val = float(var.eval())
+                defaults[var.qname()] = val
+            except Exception:
+                pass
+
+        self._sim_cache[cell_type] = sim
+        self._default_constants[cell_type] = defaults
+        logger.info("Compiled and cached Simulation for %s", cell_type)
+        return sim
+
     def run_single(
         self,
         cell_type: str,
         params: dict[str, float],
         pacing_cl_ms: float,
         n_beats: int = 1,
+        absolute_params: dict[str, float] | None = None,
     ) -> dict[str, np.ndarray]:
-        """Run a single TT2006 simulation.
+        """Run a single TT2006 simulation, reusing compiled Simulation.
 
         Parameters
         ----------
         cell_type : str
             One of ``'endo'``, ``'mid'``, ``'epi'``.
         params : dict[str, float]
-            Conductance scale factors.  Keys are Myokit variable names
-            (qualified or short); values are multiplicative scale factors
-            applied to the model's default constant value.
+            Conductance scale factors.  Keys are Myokit variable names;
+            values are multiplicative scale factors.
         pacing_cl_ms : float
             Pacing cycle length in milliseconds.
         n_beats : int
-            Number of recorded beats (the last *n_beats* are returned).
-            Typically 1.
+            Number of recorded beats (last *n_beats* returned).
+        absolute_params : dict[str, float] | None
+            Absolute-value parameter overrides.  Keys are Myokit variable
+            names; values are set directly (not multiplied by the default).
+            Use this for parameters like Ko where a physical value (e.g.
+            5.4 mM) should be set directly rather than scaled.
 
         Returns
         -------
         dict[str, np.ndarray]
-            Keys: ``'V_m'``, ``'I_Na'``, ``'I_CaL'``, ``'I_Kr'``,
-            ``'I_Ks'``, ``'I_ion_total'``, ``'t_ms'``.
-
-        Raises
-        ------
-        RuntimeError
-            If the Myokit simulation encounters an error.
+            Keys: V_m, I_Na, I_CaL, I_Kr, I_Ks, I_ion_total, t_ms.
         """
-        import myokit  # local import so workers can load independently
+        import myokit
 
-        model = self._loader.get_model(cell_type)
+        sim = self._get_or_create_sim(cell_type)
+        defaults = self._default_constants[cell_type]
+        model = sim._model  # access the model for variable name resolution
 
-        # Clone the model so parameter changes don't mutate the cached copy.
-        model = model.clone()
+        # ---- Reset simulation to initial state ----
+        sim.reset()
 
-        # ---- Apply parameter modifications (scale factors) ----
+        # ---- Apply parameter modifications via set_constant ----
         for key, scale_factor in params.items():
             qname = self._resolve_param_name(model, key)
-            var = model.get(qname)
-            default_value = var.value()
-            if not isinstance(default_value, myokit.Number):
-                # The variable might be an expression; try evaluating.
-                try:
-                    default_value = float(var.eval())
-                except Exception:
-                    logger.warning(
-                        "Cannot evaluate default for '%s'; skipping.", qname
-                    )
-                    continue
-            else:
-                default_value = float(default_value)
-            var.set_rhs(default_value * scale_factor)
-            logger.debug(
-                "Set %s = %.6g (default %.6g x %.4f)",
-                qname,
-                default_value * scale_factor,
-                default_value,
-                scale_factor,
-            )
+            if qname in defaults:
+                sim.set_constant(qname, defaults[qname] * scale_factor)
 
-        # ---- Bind stimulus to Myokit pace protocol ----
-        # CellML models have an internal piecewise i_Stim that doesn't
-        # respond to Myokit's protocol.  We override it by binding i_Stim
-        # to 'pace' so the protocol controls stimulus timing directly.
-        stim_name = _find_variable_by_suffix(model, "i_Stim")
-        if stim_name is not None:
-            stim_var = model.get(stim_name)
-            stim_var.set_binding("pace")
-            # RHS is replaced by protocol value when bound to pace
+        # ---- Apply absolute-value parameter overrides ----
+        if absolute_params:
+            for key, value in absolute_params.items():
+                qname = self._resolve_param_name(model, key)
+                sim.set_constant(qname, value)
 
+        # ---- Set pacing CL ----
         protocol = myokit.pacing.blocktrain(
             period=pacing_cl_ms,
             duration=_STIM_DURATION_MS,
-            offset=10,  # small delay before first stimulus
+            offset=10,
             level=_STIM_LEVEL,
         )
-
-        # ---- Create simulation (with retry for WinError 206) ----
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                sim = myokit.Simulation(model, protocol)
-                break
-            except (FileNotFoundError, OSError) as e:
-                if "WinError 206" in str(e) or "too long" in str(e).lower():
-                    last_err = e
-                    import time as _time
-                    _time.sleep(0.5 * (attempt + 1))
-                    logger.warning(
-                        "WinError 206 on attempt %d for %s, retrying...",
-                        attempt + 1, cell_type,
-                    )
-                    continue
-                raise
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to create Myokit simulation for "
-                    f"cell_type='{cell_type}': {exc}"
-                ) from exc
-        else:
-            raise RuntimeError(
-                f"Failed to create Myokit simulation for "
-                f"cell_type={cell_type!r} after 3 attempts: {last_err}"
-            )
+        sim.set_protocol(protocol)
 
         # ---- Pre-pace ----
         total_prepace_ms = pacing_cl_ms * self._n_prepacing_beats
@@ -261,12 +260,10 @@ class TT2006Runner:
             sim.pre(total_prepace_ms)
         except myokit.SimulationError as exc:
             raise RuntimeError(
-                f"Pre-pacing failed after {self._n_prepacing_beats} beats "
-                f"(CL={pacing_cl_ms} ms) for cell_type='{cell_type}': {exc}"
+                f"Pre-pacing failed ({cell_type}, CL={pacing_cl_ms}): {exc}"
             ) from exc
 
-        # ---- Resolve variable names by inspecting the model ----
-        # Look up actual qualified names — do NOT hardcode them.
+        # ---- Resolve log variable names ----
         v_name = _find_variable_by_suffix(model, "V")
         time_name = _find_variable_by_suffix(model, "time")
         i_na_name = _find_variable_by_suffix(model, "i_Na")
@@ -275,11 +272,8 @@ class TT2006Runner:
         i_ks_name = _find_variable_by_suffix(model, "i_Ks")
 
         if v_name is None:
-            raise RuntimeError(
-                "Could not find membrane voltage variable 'V' in model."
-            )
+            raise RuntimeError("Could not find 'V' in model.")
 
-        # Build log variable list from actual model qnames only.
         log_vars: list[str] = []
         if time_name is not None:
             log_vars.append(time_name)
@@ -294,35 +288,28 @@ class TT2006Runner:
             log = sim.run(record_duration_ms, log=log_vars, log_interval=0.1)
         except myokit.SimulationError as exc:
             raise RuntimeError(
-                f"Simulation failed during recording phase "
-                f"(CL={pacing_cl_ms} ms, n_beats={n_beats}) for "
-                f"cell_type='{cell_type}': {exc}"
+                f"Simulation failed ({cell_type}, CL={pacing_cl_ms}): {exc}"
             ) from exc
 
         # ---- Extract arrays ----
-        # Time: use the model's time variable if logged, else construct
         if time_name is not None and time_name in log:
             t_raw = np.asarray(log[time_name])
             t_ms = t_raw - t_raw[0]
         else:
-            # Fallback: construct from log length and duration
-            n_log_points = len(log[v_name])
-            t_ms = np.linspace(0, record_duration_ms, n_log_points)
+            n_pts = len(log[v_name])
+            t_ms = np.linspace(0, record_duration_ms, n_pts)
 
         v_m = np.asarray(log[v_name])
 
-        def _safe_extract(name: str | None) -> np.ndarray:
-            if name is not None and name in log:
+        def _safe(name: str | None) -> np.ndarray:
+            if name and name in log:
                 return np.asarray(log[name])
             return np.zeros_like(t_ms)
 
-        i_na = _safe_extract(i_na_name)
-        i_cal = _safe_extract(i_cal_name)
-        i_kr = _safe_extract(i_kr_name)
-        i_ks = _safe_extract(i_ks_name)
-
-        # Total ionic current: sum of all available recorded currents.
-        i_ion_total = i_na + i_cal + i_kr + i_ks
+        i_na = _safe(i_na_name)
+        i_cal = _safe(i_cal_name)
+        i_kr = _safe(i_kr_name)
+        i_ks = _safe(i_ks_name)
 
         return {
             "V_m": v_m,
@@ -330,7 +317,7 @@ class TT2006Runner:
             "I_CaL": i_cal,
             "I_Kr": i_kr,
             "I_Ks": i_ks,
-            "I_ion_total": i_ion_total,
+            "I_ion_total": i_na + i_cal + i_kr + i_ks,
             "t_ms": t_ms,
         }
 

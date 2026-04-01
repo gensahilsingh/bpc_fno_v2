@@ -1,4 +1,11 @@
-"""Stage 3: Inverse encoder — B_obs -> latent z via VAE."""
+"""Stage 3: Inverse encoder — B_obs -> latent z via VAE.
+
+Geometry conditioning uses adaLN-Zero (Adaptive Layer Normalization with
+Zero initialisation, from the DiT paper) instead of channel concatenation.
+The geometry encoder output is global-average-pooled to a (B, C) vector,
+then projected to per-channel scale and shift parameters that modulate
+the lifted B-field features *before* the FNO backbone.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +26,11 @@ class InverseEncoder(nn.Module, InverseEncoderInterface):
 
     The geometry encoder and FNO backbone are **shared** with the forward
     operator — they are passed in by reference.
+
+    Geometry conditioning is applied via adaLN-Zero: the geometry encoder
+    output is globally pooled to a conditioning vector, projected to
+    per-channel (scale, shift) pairs, and used to modulate the lifted
+    B-field features.
 
     Parameters
     ----------
@@ -58,9 +70,19 @@ class InverseEncoder(nn.Module, InverseEncoderInterface):
             nn.Linear(1024, c_hidden * 4 * 4 * 4),
         )
 
-        # Input adapter: project concatenated [B_projected, geometry_features]
-        # (2 * c_hidden channels) down to the FNO backbone's expected c_in.
-        self.input_adapter = nn.Conv3d(2 * c_hidden, c_hidden, kernel_size=1)
+        # Input adapter: lift B-projected volume (c_hidden channels) to the
+        # FNO backbone's expected c_in.  No geometry channels concatenated —
+        # geometry conditioning is via adaLN-Zero.
+        self.input_adapter = nn.Conv3d(c_hidden, c_hidden, kernel_size=1)
+
+        # adaLN-Zero conditioning layers.
+        # geo_embed_dim == c_hidden (output of VoxelGeometryEncoder).
+        self.adaLN_proj = nn.Linear(c_hidden, 2 * c_hidden)
+        nn.init.zeros_(self.adaLN_proj.weight)
+        nn.init.zeros_(self.adaLN_proj.bias)
+        self.norm = nn.GroupNorm(
+            num_groups=min(8, c_hidden), num_channels=c_hidden
+        )
 
         # VAE heads (parallel linear layers for mu and log_var)
         self.mu_head = nn.Linear(c_hidden, latent_dim)
@@ -80,21 +102,30 @@ class InverseEncoder(nn.Module, InverseEncoderInterface):
         """
         B = B_obs.shape[0]
         N = self.grid_size
+        C = self.c_hidden
 
         # Project B_obs into a volumetric feature map
         b_flat = B_obs.reshape(B, -1)                            # (B, n_sensors*3)
         b_vol = self.b_projection(b_flat)                        # (B, c_hidden*64)
-        b_vol = b_vol.view(B, self.c_hidden, 4, 4, 4)           # (B, C, 4, 4, 4)
+        b_vol = b_vol.view(B, C, 4, 4, 4)                       # (B, C, 4, 4, 4)
         b_vol = F.interpolate(
             b_vol, size=(N, N, N), mode="trilinear", align_corners=False
         )  # (B, C, N, N, N)
 
-        # Encode geometry (shared encoder)
+        # Encode geometry (shared encoder) and global-average-pool
         geo_features = self.geometry_encoder.encode(geometry)     # (B, C, N, N, N)
+        geo_cond = geo_features.mean(dim=[-3, -2, -1])           # (B, C)
 
-        # Concatenate and adapt channels
-        x = torch.cat([b_vol, geo_features], dim=1)              # (B, 2C, N, N, N)
-        x = self.input_adapter(x)                                # (B, C, N, N, N)
+        # Lift B-field volume through input adapter
+        x = self.input_adapter(b_vol)                            # (B, C, N, N, N)
+
+        # adaLN-Zero conditioning
+        cond = self.adaLN_proj(geo_cond)                         # (B, 2*C)
+        scale, shift = cond.chunk(2, dim=1)
+        scale = scale.view(B, C, 1, 1, 1)
+        shift = shift.view(B, C, 1, 1, 1)
+        x = self.norm(x)
+        x = (1 + scale) * x + shift                             # (B, C, N, N, N)
 
         # FNO backbone (shared)
         features = self.fno_backbone(x)                          # (B, C_out, N, N, N)

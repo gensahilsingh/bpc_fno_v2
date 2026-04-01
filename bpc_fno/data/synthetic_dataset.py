@@ -14,21 +14,25 @@ HDF5 schema per file:
   sensor_positions: (Ns, 3)       float32
   t_ms:          (T,)             float32
 
-For training, we select a single random timestep (during the active
-wavefront period) from each sample per access.
+For each access, we select the PEAK ACTIVATION timestep (argmax of
+sum(|J_i|) over spatial dims) and return a single-timestep slice with
+proper normalization.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 import h5py
 import numpy as np
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import Dataset
+
+from bpc_fno.utils.normalization import Normalizer
 
 logger = logging.getLogger(__name__)
 
@@ -39,19 +43,12 @@ _SPLIT_MAP: dict[str, set[int]] = {
 }
 
 
-@runtime_checkable
-class Normalizer(Protocol):
-    def normalize(self, key: str, tensor: torch.Tensor) -> torch.Tensor: ...
-    def denormalize(self, key: str, tensor: torch.Tensor) -> torch.Tensor: ...
-
-
 class SyntheticMIGDataset(Dataset):
     """PyTorch Dataset over synthetic MIG HDF5 samples.
 
-    For each access, a single timestep with significant activity is
-    selected from the time series.  This provides data augmentation
-    (different timesteps on different epochs) while keeping memory
-    manageable.
+    For each access, the peak-activation timestep is selected from the
+    time series (argmax of total |J_i| over spatial dims).  This ensures
+    the model always sees the most informative snapshot.
     """
 
     def __init__(
@@ -98,32 +95,27 @@ class SyntheticMIGDataset(Dataset):
         sample_id = self._sample_ids[idx]
 
         with h5py.File(h5_path, "r") as f:
-            T = f["J_i"].shape[0]
+            # ----- Select PEAK ACTIVATION timestep -----
+            # Compute sum(|J_i|) over spatial+component dims for each timestep
+            # J_i shape: (T, N, N, N, 3)
+            j_all = np.asarray(f["J_i"], dtype=np.float32)  # (T, N, N, N, 3)
+            # sum of absolute values over spatial (N,N,N) and component (3) dims
+            activity = np.abs(j_all).sum(axis=(1, 2, 3, 4))  # (T,)
+            t_idx = int(np.argmax(activity))
 
-            # Pick a timestep with activity (middle 60% of the time series
-            # is most likely to contain wavefront activity)
-            t_lo = max(int(T * 0.1), 0)
-            t_hi = max(int(T * 0.7), t_lo + 1)
-            t_hi = min(t_hi, T)  # clamp to available timesteps
-            if self.split == "train":
-                t_idx = np.random.randint(t_lo, t_hi)
-            else:
-                # Deterministic for val/test: pick the midpoint
-                t_idx = (t_lo + t_hi) // 2
+            # ----- Load single timestep -----
+            # J_i: (N, N, N, 3) -> (3, N, N, N)
+            j_i = torch.from_numpy(j_all[t_idx]).permute(3, 0, 1, 2)  # (3, N, N, N)
 
-            # J_i: (T, N, N, N, 3) -> pick timestep -> (N, N, N, 3) -> (3, N, N, N)
-            j_i = np.asarray(f["J_i"][t_idx], dtype=np.float32)
-            j_i = torch.from_numpy(j_i).permute(3, 0, 1, 2)  # (3, N, N, N)
+            # B_mig (clean): (Ns, 3) -> flatten to (Ns*3,)
+            b_clean = np.asarray(f["B_mig"][t_idx], dtype=np.float32)
+            b_true = torch.from_numpy(b_clean.reshape(-1))  # (Ns*3,)
 
-            # B_mig_noisy: (T, Ns, 3) -> flatten to (Ns*3,) per timestep
-            # We take a window of timesteps around t_idx for the B signal
+            # B_mig_noisy: (Ns, 3) -> flatten to (Ns*3,)
             b_noisy = np.asarray(f["B_mig_noisy"][t_idx], dtype=np.float32)
             b_noisy_flat = torch.from_numpy(b_noisy.reshape(-1))  # (Ns*3,)
 
-            b_clean = np.asarray(f["B_mig"][t_idx], dtype=np.float32)
-            b_clean_flat = torch.from_numpy(b_clean.reshape(-1))  # (Ns*3,)
-
-            # Geometry: SDF (N,N,N) + fiber (N,N,N,3) -> (4, N, N, N)
+            # ----- Geometry: SDF (N,N,N) + fiber (N,N,N,3) -> (4, N, N, N) -----
             sdf = np.asarray(f["geometry/sdf"], dtype=np.float32)
             fiber = np.asarray(f["geometry/fiber"], dtype=np.float32)
             geometry = np.concatenate(
@@ -131,21 +123,37 @@ class SyntheticMIGDataset(Dataset):
             )  # (N, N, N, 4)
             geometry = torch.from_numpy(geometry).permute(3, 0, 1, 2)  # (4, N, N, N)
 
-            sensor_pos = torch.from_numpy(
-                np.asarray(f["sensor_positions"], dtype=np.float32)
-            )
+        # ----- Normalize SDF: clamp [-5,5] / 5.0 -----
+        geometry[0] = torch.clamp(geometry[0], min=-5.0, max=5.0) / 5.0
 
-        # Normalize
-        j_i = self.normalizer.normalize("J_i", j_i)
-        b_noisy_flat = self.normalizer.normalize("B_mig", b_noisy_flat)
-        b_clean_flat = self.normalizer.normalize("B_mig_clean", b_clean_flat)
-        geometry = self.normalizer.normalize("geometry", geometry)
+        # ----- Normalize J_i using active-voxel stats -----
+        # J_i is channels-first: (3, N, N, N)
+        j_mean = torch.tensor(
+            self.normalizer.stats["J_i_mean"], dtype=torch.float32
+        ).view(3, 1, 1, 1)
+        j_std = torch.tensor(
+            self.normalizer.stats["J_i_std"], dtype=torch.float32
+        ).view(3, 1, 1, 1)
+        j_i = (j_i - j_mean) / j_std
+
+        # ----- Normalize B fields -----
+        # B stats are per-component (3,); tile across Ns sensors
+        b_comp_mean = torch.tensor(
+            self.normalizer.stats["B_mean"], dtype=torch.float32
+        )  # (3,)
+        b_comp_std = torch.tensor(
+            self.normalizer.stats["B_std"], dtype=torch.float32
+        )  # (3,)
+        n_sensors = b_true.shape[0] // 3
+        b_mean_tiled = b_comp_mean.repeat(n_sensors)  # (Ns*3,)
+        b_std_tiled = b_comp_std.repeat(n_sensors)    # (Ns*3,)
+
+        b_true = (b_true - b_mean_tiled) / b_std_tiled
+        b_noisy_flat = (b_noisy_flat - b_mean_tiled) / b_std_tiled
 
         return {
             "J_i": j_i,                    # (3, N, N, N)
-            "B_mig": b_noisy_flat,          # (Ns*3,) — model input
-            "B_mig_clean": b_clean_flat,    # (Ns*3,) — for loss
+            "B_true": b_true,               # (Ns*3,) — clean, for loss
+            "B_noisy": b_noisy_flat,         # (Ns*3,) — model input
             "geometry": geometry,            # (4, N, N, N)
-            "sensor_pos": sensor_pos,        # (Ns, 3)
-            "sample_id": sample_id,
         }

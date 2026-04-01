@@ -2,21 +2,20 @@
 
 Handles both Phase 1 (forward-only) and Phase 2 (joint forward + inverse)
 losses with configurable weighting and scheduling of the physics loss term.
+
+Self-contained: all loss computations (MSE, KL, physics residual,
+consistency) are implemented directly here without external physics module
+dependencies.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
-
-from bpc_fno.models.interfaces import ForwardOperatorInterface
-from bpc_fno.physics.consistency_loss import ForwardConsistencyLoss
-from bpc_fno.physics.monodomain_loss import MonodomainPDELoss
 
 logger = logging.getLogger(__name__)
 
@@ -27,199 +26,310 @@ class LossManager:
     Parameters
     ----------
     config:
-        OmegaConf configuration.  Expected keys under ``config.loss``:
+        OmegaConf configuration.  Expected keys under ``config.training``:
 
-        - ``lambda_KL`` (float): weight for the VAE KL-divergence term.
+        - ``lambda_kl_init`` (float): weight for the VAE KL-divergence term.
         - ``lambda_physics_init`` (float): initial weight for the physics loss.
         - ``lambda_physics_final`` (float): cap for the physics loss weight.
         - ``lambda_physics_doubling_epochs`` (int): epochs between doublings.
         - ``lambda_consistency`` (float): weight for the forward-consistency loss.
-        - ``consistency_start_epoch`` (int): epoch at which L_consistency turns on.
-        - ``voxel_size_cm`` (float): passed through to MonodomainPDELoss.
-        - ``n_collocation_points`` (int): collocation points for physics residual.
+        - ``lambda_consistency_start_epoch`` (int): epoch at which L_consistency turns on.
+        - ``voxel_size_cm`` (float): voxel spacing for central-FD divergence.
     """
 
     def __init__(self, config: DictConfig) -> None:
         self.config = config
-        loss_cfg = config.loss
+        t = config.training
 
         # Lambda weights
-        self.lambda_KL: float = float(loss_cfg.get("lambda_KL", 1e-4))
+        self.lambda_kl: float = float(t.get("lambda_kl_init", 1e-4))
         self.lambda_physics_init: float = float(
-            loss_cfg.get("lambda_physics_init", 1e-3)
+            t.get("lambda_physics_init", 1e-3)
         )
         self.lambda_physics_final: float = float(
-            loss_cfg.get("lambda_physics_final", 1.0)
+            t.get("lambda_physics_final", 0.05)
         )
         self.lambda_physics_doubling_epochs: int = int(
-            loss_cfg.get("lambda_physics_doubling_epochs", 10)
+            t.get("lambda_physics_doubling_epochs", 20)
         )
         self.lambda_consistency: float = float(
-            loss_cfg.get("lambda_consistency", 0.1)
+            t.get("lambda_consistency", 0.01)
         )
         self.consistency_start_epoch: int = int(
-            loss_cfg.get("consistency_start_epoch", 5)
+            t.get("lambda_consistency_start_epoch", 30)
         )
+        self.voxel_size_cm: float = float(t.get("voxel_size_cm", 0.1))
 
         # Current epoch (updated externally by the trainer)
         self.current_epoch: int = 0
 
-        # Loss function instances
-        physics_cfg = DictConfig(
-            {
-                "voxel_size_cm": float(loss_cfg.get("voxel_size_cm", 0.1)),
-                "n_collocation_points": int(
-                    loss_cfg.get("n_collocation_points", 1024)
-                ),
-            }
-        )
-        self.monodomain_loss = MonodomainPDELoss(physics_cfg)
-        self.consistency_loss = ForwardConsistencyLoss()
+    # ------------------------------------------------------------------
+    # Individual loss terms
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def forward_loss(B_pred: torch.Tensor, B_true: torch.Tensor) -> torch.Tensor:
+        """MSE between predicted and true B-field.
+
+        Args:
+            B_pred: (B, N_sensors) predicted sensor measurements.
+            B_true: (B, N_sensors) ground-truth sensor measurements.
+
+        Returns:
+            Scalar MSE loss.
+        """
+        return F.mse_loss(B_pred, B_true)
+
+    @staticmethod
+    def recon_loss(J_i_hat: torch.Tensor, J_i_true: torch.Tensor) -> torch.Tensor:
+        """MSE between reconstructed and true current density.
+
+        Args:
+            J_i_hat: (B, 3, N, N, N) reconstructed current density.
+            J_i_true: (B, 3, N, N, N) ground-truth current density.
+
+        Returns:
+            Scalar MSE loss.
+        """
+        return F.mse_loss(J_i_hat, J_i_true)
+
+    @staticmethod
+    def kl_loss(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """KL divergence between N(mu, sigma^2) and N(0, 1).
+
+        KL = -0.5 * mean(1 + log_var - mu^2 - exp(log_var))
+
+        Args:
+            mu: (B, D) latent mean.
+            log_var: (B, D) log-variance.
+
+        Returns:
+            Scalar KL loss.
+        """
+        return -0.5 * torch.mean(1.0 + log_var - mu.pow(2) - log_var.exp())
+
+    @staticmethod
+    def physics_residual_loss(
+        J_i_hat: torch.Tensor, voxel_size_cm: float
+    ) -> torch.Tensor:
+        """Physics residual: mean(div(J_i)^2) via central finite differences.
+
+        Penalises violation of current conservation (div(J_i) ~ 0 in
+        quasi-static tissue).  Uses second-order central differences with
+        zero-valued boundaries.
+
+        Args:
+            J_i_hat: (B, 3, N, N, N) predicted current density
+                     (channels: J_x, J_y, J_z).
+            voxel_size_cm: Spatial step in cm.
+
+        Returns:
+            Scalar mean-squared-divergence loss.
+        """
+        inv_2h = 1.0 / (2.0 * voxel_size_cm)
+
+        # dJ_x / dx  — central differences along spatial dim 2
+        dJx_dx = torch.zeros_like(J_i_hat[:, 0:1])
+        dJx_dx[:, :, 1:-1, :, :] = (
+            J_i_hat[:, 0:1, 2:, :, :] - J_i_hat[:, 0:1, :-2, :, :]
+        ) * inv_2h
+
+        # dJ_y / dy  — central differences along spatial dim 3
+        dJy_dy = torch.zeros_like(J_i_hat[:, 0:1])
+        dJy_dy[:, :, :, 1:-1, :] = (
+            J_i_hat[:, 1:2, :, 2:, :] - J_i_hat[:, 1:2, :, :-2, :]
+        ) * inv_2h
+
+        # dJ_z / dz  — central differences along spatial dim 4
+        dJz_dz = torch.zeros_like(J_i_hat[:, 0:1])
+        dJz_dz[:, :, :, :, 1:-1] = (
+            J_i_hat[:, 2:3, :, :, 2:] - J_i_hat[:, 2:3, :, :, :-2]
+        ) * inv_2h
+
+        div_J = dJx_dx + dJy_dy + dJz_dz  # (B, 1, N, N, N)
+        return (div_J ** 2).mean()
+
+    @staticmethod
+    def consistency_loss(
+        B_check: torch.Tensor, B_obs: torch.Tensor
+    ) -> torch.Tensor:
+        """MSE between re-predicted B-field and observed B-field.
+
+        Args:
+            B_check: (B, N_sensors) B-field predicted from J_i_hat.
+            B_obs: (B, N_sensors) observed B-field measurements.
+
+        Returns:
+            Scalar MSE loss.
+        """
+        return F.mse_loss(B_check, B_obs)
 
     # ------------------------------------------------------------------
     # Phase 1: forward-only
     # ------------------------------------------------------------------
 
-    def compute_phase1_loss(
+    def compute_phase1(
         self,
-        model_output: dict[str, torch.Tensor],
+        outputs: dict[str, torch.Tensor],
         batch: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute Phase 1 (forward-only) loss.
+    ) -> dict[str, torch.Tensor | float]:
+        """Compute Phase 1 (forward-only) losses.
 
         Parameters
         ----------
-        model_output:
-            Must contain ``'B_pred'`` — predicted B-field ``(B, S, T)``.
+        outputs:
+            Must contain ``'B_pred'`` — predicted B-field.
         batch:
-            Must contain ``'B_obs'`` — ground-truth B-field ``(B, S, T)``.
+            Must contain ``'B_obs'`` — ground-truth B-field.
 
         Returns
         -------
-        (total_loss, loss_dict)
-            Scalar loss tensor and a dictionary of named loss values for logging.
+        dict
+            Contains individual loss values and ``'total'`` scalar tensor.
         """
-        L_data_forward = F.mse_loss(model_output["B_pred"], batch["B_obs"])
+        L_forward = self.forward_loss(outputs["B_pred"], batch["B_obs"])
 
-        loss_dict: dict[str, float] = {
-            "L_data_forward": L_data_forward.item(),
-            "total_loss": L_data_forward.item(),
+        return {
+            "L_data_forward": L_forward,
+            "total": L_forward,
         }
-        return L_data_forward, loss_dict
 
     # ------------------------------------------------------------------
     # Phase 2: joint forward + inverse
     # ------------------------------------------------------------------
 
-    def compute_phase2_loss(
+    def compute_phase2(
         self,
-        model_output: dict[str, torch.Tensor],
+        outputs: dict[str, torch.Tensor],
         batch: dict[str, torch.Tensor],
-        forward_model: ForwardOperatorInterface,
+        model: Any,
         epoch: int,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute Phase 2 (joint) loss with all terms.
+        cfg: DictConfig,
+    ) -> dict[str, torch.Tensor | float]:
+        """Compute Phase 2 (joint) losses with all terms.
+
+        The consistency loss uses ``torch.no_grad()`` on the forward model
+        call (so the forward model's weights do not receive gradients from
+        this path) but does NOT detach ``J_i_hat`` (so the decoder that
+        produced it still gets gradients).
 
         Parameters
         ----------
-        model_output:
+        outputs:
             Expected keys: ``'B_pred'``, ``'J_i_hat'``, ``'mu'``,
             ``'log_var'``.
         batch:
             Expected keys: ``'B_obs'``, ``'J_i'``, ``'geometry'``.
-        forward_model:
-            The forward PINO model, used for the consistency loss.
-            Its weights must NOT be updated by the consistency loss --
-            the trainer is responsible for zeroing forward-model gradients
-            after backward.
+        model:
+            The full BPC-FNO model.  Its ``forward_pino.predict_B`` is
+            called with forward-model parameters temporarily frozen for
+            the consistency term.
         epoch:
             Current training epoch.
+        cfg:
+            OmegaConf configuration (same as ``self.config``; passed
+            explicitly so the caller can override).
 
         Returns
         -------
-        (total_loss, loss_dict)
-            Scalar loss tensor and a dictionary of named loss values for logging.
+        dict
+            Contains individual loss values (as tensors or floats) and
+            ``'total'`` scalar tensor for backpropagation.
         """
-        loss_dict: dict[str, float] = {}
+        result: dict[str, torch.Tensor | float] = {}
 
         # --- L_data_forward: MSE(B_pred, B_true) ---
-        L_data_forward = F.mse_loss(model_output["B_pred"], batch["B_obs"])
-        loss_dict["L_data_forward"] = L_data_forward.item()
+        L_forward = self.forward_loss(outputs["B_pred"], batch["B_obs"])
+        result["L_data_forward"] = L_forward
 
         # --- L_data_recon: MSE(J_i_hat, J_i_true) ---
-        L_data_recon = F.mse_loss(model_output["J_i_hat"], batch["J_i"])
-        loss_dict["L_data_recon"] = L_data_recon.item()
+        L_recon = self.recon_loss(outputs["J_i_hat"], batch["J_i"])
+        result["L_data_recon"] = L_recon
 
         # --- L_KL: KL divergence ---
-        mu = model_output["mu"]
-        log_var = model_output["log_var"]
-        L_KL = -0.5 * torch.mean(
-            1.0 + log_var - mu.pow(2) - log_var.exp()
-        )
-        loss_dict["L_KL"] = L_KL.item()
+        L_kl = self.kl_loss(outputs["mu"], outputs["log_var"])
+        result["L_KL"] = L_kl
 
-        # --- L_physics: monodomain PDE residual ---
-        lambda_physics = self.get_lambda_physics(epoch)
-        geometry = batch["geometry"]
-        myocardium_mask = geometry[:, 3:4, :, :, :]
-        L_physics = self.monodomain_loss(
-            model_output["J_i_hat"], geometry, myocardium_mask
+        # --- L_physics: div(J_i)^2 residual ---
+        lambda_physics = self.get_lambda_physics(epoch, cfg)
+        L_physics = self.physics_residual_loss(
+            outputs["J_i_hat"], self.voxel_size_cm
         )
-        loss_dict["L_physics"] = L_physics.item()
-        loss_dict["lambda_physics"] = lambda_physics
+        result["L_physics"] = L_physics
+        result["lambda_physics"] = lambda_physics
 
         # --- L_consistency: forward-consistency (delayed start) ---
-        L_consistency: torch.Tensor
         if epoch >= self.consistency_start_epoch:
-            L_consistency = self.consistency_loss(
-                forward_model,
-                model_output["J_i_hat"],
-                geometry,
-                batch["B_obs"],
-            )
+            J_i_hat = outputs["J_i_hat"]  # keep in computation graph
+            geometry = batch["geometry"]
+
+            # Temporarily freeze forward-model parameters so they receive
+            # no gradients from this path, but the computation graph still
+            # connects through J_i_hat so the decoder gets gradients.
+            fwd_params_grad_state: list[tuple[torch.nn.Parameter, bool]] = []
+            for p in model.forward_pino.parameters():
+                fwd_params_grad_state.append((p, p.requires_grad))
+                p.requires_grad_(False)
+
+            B_check = model.forward_pino.predict_B(J_i_hat, geometry)
+
+            # Restore requires_grad on forward-model parameters
+            for p, grad_flag in fwd_params_grad_state:
+                p.requires_grad_(grad_flag)
+
+            L_consistency = self.consistency_loss(B_check, batch["B_obs"])
         else:
             L_consistency = torch.tensor(
                 0.0,
-                device=model_output["B_pred"].device,
-                dtype=model_output["B_pred"].dtype,
+                device=outputs["B_pred"].device,
+                dtype=outputs["B_pred"].dtype,
             )
-        loss_dict["L_consistency"] = L_consistency.item()
+        result["L_consistency"] = L_consistency
 
         # --- Total loss ---
         L_total = (
-            L_data_forward
-            + L_data_recon
-            + self.lambda_KL * L_KL
+            L_forward
+            + L_recon
+            + self.lambda_kl * L_kl
             + lambda_physics * L_physics
             + self.lambda_consistency * L_consistency
         )
-        loss_dict["total_loss"] = L_total.item()
+        result["total"] = L_total
 
-        return L_total, loss_dict
+        return result
 
     # ------------------------------------------------------------------
     # Physics weight schedule
     # ------------------------------------------------------------------
 
-    def get_lambda_physics(self, epoch: int) -> float:
+    @staticmethod
+    def get_lambda_physics(epoch: int, cfg: DictConfig) -> float:
         """Compute the physics loss weight for a given epoch.
 
         The weight starts at ``lambda_physics_init`` and doubles every
-        ``lambda_physics_doubling_epochs``, capped at ``lambda_physics_final``.
+        ``lambda_physics_doubling_epochs``, capped at
+        ``lambda_physics_final``.
 
         Parameters
         ----------
         epoch:
             Current training epoch.
+        cfg:
+            OmegaConf configuration with ``training`` sub-key.
 
         Returns
         -------
         float
             Physics loss weight for this epoch.
         """
-        if self.lambda_physics_doubling_epochs <= 0:
-            return self.lambda_physics_init
+        t = cfg.training
+        init = float(t.get("lambda_physics_init", 1e-3))
+        final = float(t.get("lambda_physics_final", 0.05))
+        doubling = int(t.get("lambda_physics_doubling_epochs", 20))
 
-        n_doublings = epoch // self.lambda_physics_doubling_epochs
-        weight = self.lambda_physics_init * (2.0 ** n_doublings)
-        return min(weight, self.lambda_physics_final)
+        if doubling <= 0:
+            return init
+
+        n_doublings = epoch // doubling
+        weight = init * (2.0 ** n_doublings)
+        return min(weight, final)

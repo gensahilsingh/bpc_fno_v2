@@ -2,12 +2,15 @@
 
 Trains the shared FNO backbone and the forward-PINO head to predict
 magnetic field measurements B from current density J_i and geometry.
+
+Plain PyTorch training loop (no Lightning).
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -56,23 +59,24 @@ def _build_optimizer(
 
 def _build_scheduler(
     optimizer: torch.optim.Optimizer, config: DictConfig, steps_per_epoch: int
-) -> torch.optim.lr_scheduler._LRScheduler:
-    """Build a cosine-annealing LR scheduler with optional warmup."""
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Build a cosine-annealing LR scheduler with linear warmup."""
     total_epochs: int = int(config.training.phase1_epochs)
     warmup_steps: int = int(config.training.get("lr_warmup_steps", 0))
+    lr_init: float = float(config.training.lr_init)
     lr_final: float = float(config.training.lr_final)
 
     total_steps = total_epochs * steps_per_epoch
 
     def lr_lambda(step: int) -> float:
+        # Linear warmup
         if step < warmup_steps:
             return max(step / max(warmup_steps, 1), 1e-6)
+        # Cosine decay from lr_init to lr_final
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        cosine_decay = 0.5 * (1.0 + __import__("math").cos(
-            __import__("math").pi * progress
-        ))
-        lr_init = float(config.training.lr_init)
-        return max((lr_final / lr_init) + (1.0 - lr_final / lr_init) * cosine_decay, lr_final / lr_init)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        min_ratio = lr_final / lr_init
+        return max(min_ratio + (1.0 - min_ratio) * cosine_decay, min_ratio)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -122,7 +126,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--device", default=None,
-        help="Device to train on (default: auto-detect)",
+        help="Device to train on (default: auto-detect CUDA)",
     )
     args = parser.parse_args()
 
@@ -143,7 +147,7 @@ def main() -> None:
     try:
         config = OmegaConf.load(args.config)
 
-        # Resolve device.
+        # ---- Device auto-detection ----
         if args.device is not None:
             device = torch.device(args.device)
         elif torch.cuda.is_available():
@@ -152,13 +156,13 @@ def main() -> None:
             device = torch.device("cpu")
         logger.info("Using device: %s", device)
 
-        # Load normalizer.
+        # ---- Load normalizer ----
         normalizer = Normalizer()
         normalizer.load(norm_path)
-        norm_proxy = _create_normalizer_proxy(normalizer)
 
-        # Create data module.
-        data_module = BPCFNODataModule(config, normalizer=norm_proxy)
+        # ---- Create data module (num_workers=0 for Windows) ----
+        # Dataset accesses normalizer.stats directly (no proxy needed)
+        data_module = BPCFNODataModule(config, normalizer=normalizer)
         data_module.setup(stage="fit")
         train_loader = data_module.train_dataloader()
         val_loader = data_module.val_dataloader()
@@ -169,16 +173,16 @@ def main() -> None:
             len(val_loader),
         )
 
-        # Create model.
+        # ---- Create model ----
         model = BPC_FNO_A(config).to(device)
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Model created: %d total parameters", total_params)
 
-        # Create optimizer and scheduler.
+        # ---- Optimizer + cosine LR schedule with warmup ----
         optimizer = _build_optimizer(model, config)
         scheduler = _build_scheduler(optimizer, config, steps_per_epoch)
 
-        # Training loop.
+        # ---- Training loop ----
         n_epochs: int = int(config.training.phase1_epochs)
         grad_clip: float = float(config.training.get("grad_clip_norm", 1.0))
         best_val_loss = float("inf")
@@ -195,7 +199,7 @@ def main() -> None:
             for batch in train_loader:
                 J_i = batch["J_i"].to(device)
                 geometry = batch["geometry"].to(device)
-                B_target = batch["B_mig_clean"].to(device)
+                B_target = batch["B_true"].to(device)
 
                 B_pred = model.forward_only(J_i, geometry)
                 loss = F.mse_loss(B_pred, B_target)
@@ -220,7 +224,7 @@ def main() -> None:
                 for batch in val_loader:
                     J_i = batch["J_i"].to(device)
                     geometry = batch["geometry"].to(device)
-                    B_target = batch["B_mig_clean"].to(device)
+                    B_target = batch["B_true"].to(device)
 
                     B_pred = model.forward_only(J_i, geometry)
                     loss = F.mse_loss(B_pred, B_target)

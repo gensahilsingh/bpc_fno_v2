@@ -18,12 +18,12 @@ training:
   lr_final: 1.0e-5
   lr_warmup_steps: 500
   grad_clip_norm: 1.0
-  lambda_physics_init: 0.01
-  lambda_physics_final: 0.1
+  lambda_physics_init: 0.001
+  lambda_physics_final: 0.05
   lambda_physics_doubling_epochs: 20
-  lambda_kl_init: 0.001
-  lambda_consistency_start_epoch: 10
-  lambda_consistency: 0.1
+  lambda_kl_init: 0.0001
+  lambda_consistency_start_epoch: 30
+  lambda_consistency: 0.01
   n_collocation_points: 1024
 
 data:

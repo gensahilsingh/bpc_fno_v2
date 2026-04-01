@@ -21,7 +21,6 @@ import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
 
-from bpc_fno.physics.monodomain_loss import MonodomainPDELoss
 from bpc_fno.training.loss_manager import LossManager
 from bpc_fno.training.lr_schedule import CosineWarmupScheduler
 
@@ -140,13 +139,18 @@ class BPCFNOTrainer(pl.LightningModule):
         scheduler = self.lr_schedulers()
 
         if self.phase == "forward":
-            output = self.model.forward_only(batch["J_i"], batch["geometry"])
-            loss, loss_dict = self.loss_manager.compute_phase1_loss(output, batch)
+            B_pred = self.model.forward_only(batch["J_i"], batch["geometry"])
+            output = {"B_pred": B_pred}
+            result = self.loss_manager.compute_phase1(output, batch)
+            loss = result["total"]
+            loss_dict = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in result.items()}
         else:
             output = self.model(batch)
-            loss, loss_dict = self.loss_manager.compute_phase2_loss(
-                output, batch, self.model.forward_pino, self.current_epoch
+            result = self.loss_manager.compute_phase2(
+                output, batch, self.model, self.current_epoch, self.config
             )
+            loss = result["total"]
+            loss_dict = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in result.items()}
 
         # Store output for diagnostics callback
         self._last_output = output
@@ -218,11 +222,12 @@ class BPCFNOTrainer(pl.LightningModule):
         batch_size = batch["B_obs"].shape[0]
 
         if self.phase == "forward":
-            output = self.model.forward_only(batch["J_i"], batch["geometry"])
-            loss, loss_dict = self.loss_manager.compute_phase1_loss(output, batch)
+            B_pred = self.model.forward_only(batch["J_i"], batch["geometry"])
+            output = {"B_pred": B_pred}
+            result = self.loss_manager.compute_phase1(output, batch)
+            loss_dict = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in result.items()}
 
             # Relative L2 error for forward B-field
-            B_pred = output["B_pred"]
             B_true = batch["B_obs"]
             l2_error = torch.norm(B_pred - B_true) / (torch.norm(B_true) + 1e-8)
             self.log(
@@ -235,9 +240,10 @@ class BPCFNOTrainer(pl.LightningModule):
 
         else:
             output = self.model(batch)
-            loss, loss_dict = self.loss_manager.compute_phase2_loss(
-                output, batch, self.model.forward_pino, self.current_epoch
+            result = self.loss_manager.compute_phase2(
+                output, batch, self.model, self.current_epoch, self.config
             )
+            loss_dict = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in result.items()}
 
             # Reconstruction loss for J_i
             recon_loss = F.mse_loss(output["J_i_hat"], batch["J_i"])
@@ -262,20 +268,10 @@ class BPCFNOTrainer(pl.LightningModule):
             )
 
             # Physics residual for the callback
-            physics_cfg = DictConfig(
-                {
-                    "voxel_size_cm": float(
-                        self.config.loss.get("voxel_size_cm", 0.1)
-                    ),
-                    "n_collocation_points": int(
-                        self.config.loss.get("n_collocation_points", 1024)
-                    ),
-                }
+            voxel_size = float(self.config.training.get("voxel_size_cm", 0.1))
+            residual = LossManager.physics_residual_loss(
+                output["J_i_hat"], voxel_size
             )
-            physics_loss_fn = MonodomainPDELoss(physics_cfg)
-            physics_loss_fn = physics_loss_fn.to(batch["J_i"].device)
-            geometry = batch["geometry"]
-            residual = physics_loss_fn(output["J_i_hat"], geometry)
             self._last_val_physics_residual = residual.item()
 
         # Log all loss terms
@@ -351,7 +347,7 @@ class BPCFNOTrainer(pl.LightningModule):
         self.loss_manager.current_epoch = self.current_epoch
 
         # Log the current physics weight
-        lambda_phys = self.loss_manager.get_lambda_physics(self.current_epoch)
+        lambda_phys = LossManager.get_lambda_physics(self.current_epoch, self.config)
         self.log("train/lambda_physics", lambda_phys, on_epoch=True)
 
         logger.info(

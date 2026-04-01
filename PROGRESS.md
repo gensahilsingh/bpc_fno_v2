@@ -112,6 +112,150 @@ See BLOCKED.md and CLOUD_DATAGEN.md for details and next steps.
 - 50/50 samples: PASS (100%), 7.8s/sample
 - 4000-sample generation: RUNNING (~8.7 hours ETA)
 
+## Training Scripts Rewrite + Verification Scripts (COMPLETED)
+
+**Task D1: scripts/train_forward.py rewritten as plain PyTorch**
+- Confirmed already plain PyTorch (no Lightning in training loop)
+- Cleaned up: replaced inline `__import__("math")` with proper `import math`
+- Features verified present: AdamW optimizer with lr from config, cosine LR schedule
+  with linear warmup, gradient clipping from config, per-epoch logging of
+  train_loss/val_loss/lr, best checkpoint saved to checkpoints/phase1_best.pt,
+  file logging to logs/train_phase1.log, CUDA auto-detection, num_workers=0
+  (via config data.num_workers)
+
+**Task D2: scripts/train_joint.py rewritten as plain PyTorch**
+- Added cosine LR scheduler with warmup (was missing -- only had optimizer, no scheduler)
+- Added LR logging to epoch log line
+- Added scheduler.step() per training step
+- Features verified present: Phase 1 checkpoint loading, all parameters trained,
+  differential learning rates (0.1x shared FNO + forward head, 1x inverse + decoder),
+  all loss terms logged every epoch (total, recon, fwd, kl, cons, phys, val, lam_p, lam_c),
+  best checkpoint saved to checkpoints/phase2_best.pt,
+  file logging to logs/train_phase2.log
+
+**Task D3: scripts/verify_data.py created**
+- Loads 20 evenly-spaced samples from data/synthetic
+- 7 checks with PASS/FAIL output:
+  1. B_mig range: 1e-14 < max(|B|) < 1e-10 T
+  2. J_i range: 0.1 < max(|J|) < 10.0 uA/cm^2
+  3. J_i std across samples > 0.05
+  4. At least 2 cell types present
+  5. V_m NOT stored
+  6. No NaN/Inf
+  7. Shapes correct: J_i (T,32,32,32,3), B_mig (T,16,3)
+- argparse CLI, dual logging (console + logs/verify_data.log), error handling
+
+**Task D4: scripts/sanity_check_conv.py created**
+- ConvBaseline model: Conv3d(3->32)->GELU->Conv3d(32->64,s2)->GELU->Conv3d(64->64,s2)->GELU->AdaptiveAvgPool3d(4)->Flatten->Linear(64*64,48)
+- Trains 30 epochs on first 200 samples, validates on next 40
+- Auto-computes normalization stats from training subset
+- Prints "CONV BASELINE CONVERGES" if val_loss < 0.5, else "CONV BASELINE FAILS"
+- argparse CLI, dual logging (console + logs/sanity_check_conv.log), error handling
+- num_workers=0 for Windows compatibility
+
+**Files changed:**
+- `scripts/train_forward.py` -- rewritten (cleaned up math import, confirmed plain PyTorch)
+- `scripts/train_joint.py` -- rewritten (added cosine LR scheduler, LR logging)
+- `scripts/verify_data.py` -- new file
+- `scripts/sanity_check_conv.py` -- new file
+
+## adaLN-Zero Geometry Conditioning + Loss Manager Rewrite (COMPLETED)
+
+**Task C1: Replace torch.cat geometry conditioning with adaLN-Zero**
+
+Replaced channel-concatenation geometry conditioning with adaLN-Zero
+(Adaptive Layer Normalisation with Zero initialisation, from the DiT paper)
+in both ForwardPINO and InverseEncoder. Instead of concatenating geometry
+encoder features along the channel dimension and using a wider Conv3d
+input adapter, the geometry encoder output is now global-average-pooled
+to a (B, C) conditioning vector, projected through a zero-initialised
+linear layer to per-channel (scale, shift) pairs, and applied via
+GroupNorm + affine modulation before the shared FNO backbone.
+
+**Files changed:**
+- `bpc_fno/models/forward_pino.py` -- input_adapter: Conv3d(3+C, C) -> Conv3d(3, C);
+  added adaLN_proj (zero-init Linear), GroupNorm; predict_B uses GAP + adaLN-Zero
+- `bpc_fno/models/inverse_encoder.py` -- input_adapter: Conv3d(2*C, C) -> Conv3d(C, C);
+  added adaLN_proj (zero-init Linear), GroupNorm; encode_to_latent uses GAP + adaLN-Zero
+
+**Architecture preserved:** No changes to layer counts, hidden dims, FNO backbone,
+sensor head, VAE heads, or decoder. Only the conditioning mechanism changed.
+
+**Task C2: Rewrite loss_manager.py**
+
+Rewrote `bpc_fno/training/loss_manager.py` as a self-contained module with no
+external physics module dependencies. All loss computations implemented inline.
+
+Methods:
+- `forward_loss(B_pred, B_true)` -- MSE
+- `recon_loss(J_i_hat, J_i_true)` -- MSE
+- `kl_loss(mu, log_var)` -- standard VAE KL: -0.5 * mean(1 + log_var - mu^2 - exp(log_var))
+- `physics_residual_loss(J_i_hat, voxel_size_cm)` -- mean(div(J_i)^2) via central FD
+- `consistency_loss(B_check, B_obs)` -- MSE
+- `compute_phase1(outputs, batch)` -- returns dict with 'total'
+- `compute_phase2(outputs, batch, model, epoch, cfg)` -- returns dict with 'total'
+- `get_lambda_physics(epoch, cfg)` -- doubles every N epochs, capped
+
+Consistency loss implementation: forward model parameters are temporarily
+frozen (requires_grad=False) during predict_B call, so they receive no
+gradients, but J_i_hat remains in the computation graph so the decoder
+gets gradients. Forward params restored immediately after.
+
+Config reads from `config.training.*` (not `config.loss.*`).
+
+**Task C3: Config hyperparameters verified**
+
+All values in `configs/arch_a.yaml` match specification:
+- lambda_kl_init: 0.0001
+- lambda_physics_init: 0.001
+- lambda_physics_final: 0.05
+- lambda_consistency_start_epoch: 30
+- lambda_consistency: 0.01
+
+**Verification:**
+- End-to-end model test: B_pred shape (2, 48), J_i_hat shape (2, 3, 32, 32, 32)
+- Shared weights verified: forward_pino.fno_backbone is inverse_encoder.fno_backbone
+- Phase 1 loss: computes correctly
+- Phase 2 loss: all 5 terms compute correctly
+- Consistency loss active only when epoch >= 30
+- Lambda_physics schedule: 0.001 -> 0.002 -> 0.004 -> ... -> 0.05 (capped)
+- Gradient flow verified: decoder gets gradients from consistency loss,
+  forward-only params do not
+
+## Normalization Fix + Dataset Rewrite (COMPLETED)
+
+**Problem:** Old normalization computed stats over ALL voxels including ~90% resting tissue (near zero). This made J_i_std tiny (~0.007-0.045), causing normalized values to range [-51, +57]. The model learned nothing.
+
+**Fix B1: Rewrote Normalizer.fit() in `bpc_fno/utils/normalization.py`:**
+- Selects **peak activation timestep** per file (argmax of total |J_i|)
+- Masks to **top 5% by magnitude** (95th percentile threshold) to capture wavefront only
+- Uses **shared std** across all 3 J_i components (max of per-component stds), since J_i is a vector field
+- B stats unchanged: computed from all values across 10 subsampled timesteps
+- New J_i_std: [0.188, 0.188, 0.188] (was [0.045, 0.045, 0.045])
+- Verification: normalized value of 1.5 uA/cm^2 gives check ~8.0 for all components (< 10, PASS)
+
+**Fix B2: Rewrote SyntheticMIGDataset.__getitem__() in `bpc_fno/data/synthetic_dataset.py`:**
+- Selects **peak activation timestep** (argmax of sum(|J_i|) over spatial dims)
+- Permutes J to channels-first (3,N,N,N)
+- Flattens B to (Ns*3,)
+- Builds geometry tensor (4,N,N,N) from SDF + fiber
+- Normalizes SDF: clamp [-5,5] / 5.0
+- Normalizes J: (J - mean.view(3,1,1,1)) / std.view(3,1,1,1) -- no epsilon (std is already safe)
+- Normalizes B: tiles 3-component mean/std across sensors
+- Returns dict with keys: 'J_i', 'B_true' (clean), 'B_noisy', 'geometry'
+- Removed old keys: 'B_mig', 'B_mig_clean', 'sensor_pos', 'sample_id'
+- Fixed critical epsilon bug: old code used `/ (std + 1e-8)` which destroyed B normalization since B_std is ~7e-13
+
+**Fix B3: Deleted invalid checkpoints:**
+- Removed phase1_best.pt, phase1_final.pt, phase2_best.pt (trained with wrong normalization)
+- Only phase2_final.pt remains
+
+**Verification (post-fix):**
+- J_i normalized range: [-10, +10] (was [-51, +57])
+- B_true normalized range: [-6, +5] (was ~0 due to epsilon bug)
+- B_noisy normalized range: [-95, +78] (noise-dominated, expected)
+- Geometry range: [-0.87, 1.0] (SDF clamped, fiber unchanged)
+
 ## What works and is ready:
 - Pipeline code is correct and tested up to the Myokit compilation step
 - All non-Myokit components verified (geometry, conductivity, Biot-Savart, noise model)

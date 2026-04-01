@@ -2,6 +2,8 @@
 
 Loads a Phase 1 checkpoint and fine-tunes all model components end-to-end,
 including the forward consistency loss and physics-informed losses.
+
+Plain PyTorch training loop (no Lightning).
 """
 
 from __future__ import annotations
@@ -42,7 +44,11 @@ logger = logging.getLogger(__name__)
 def _build_optimizer(
     model: BPC_FNO_A, config: DictConfig
 ) -> torch.optim.Optimizer:
-    """Build AdamW optimizer with differential learning rates per group."""
+    """Build AdamW optimizer with differential learning rates per group.
+
+    0.1x for shared FNO + forward head (pre-trained in Phase 1),
+    1x for inverse head + decoder (new components).
+    """
     param_groups = model.get_parameter_groups()
     lr: float = float(config.training.lr_init)
     return torch.optim.AdamW(
@@ -54,6 +60,28 @@ def _build_optimizer(
         ],
         weight_decay=1e-4,
     )
+
+
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer, config: DictConfig, steps_per_epoch: int
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Build a cosine-annealing LR scheduler with linear warmup for Phase 2."""
+    total_epochs: int = int(config.training.phase2_epochs)
+    warmup_steps: int = int(config.training.get("lr_warmup_steps", 0))
+    lr_init: float = float(config.training.lr_init)
+    lr_final: float = float(config.training.lr_final)
+
+    total_steps = total_epochs * steps_per_epoch
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return max(step / max(warmup_steps, 1), 1e-6)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        min_ratio = lr_final / lr_init
+        return max(min_ratio + (1.0 - min_ratio) * cosine_decay, min_ratio)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def _get_lambda_physics(epoch: int, config: DictConfig) -> float:
@@ -132,7 +160,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--device", default=None,
-        help="Device to train on (default: auto-detect)",
+        help="Device to train on (default: auto-detect CUDA)",
     )
     args = parser.parse_args()
 
@@ -162,7 +190,7 @@ def main() -> None:
     try:
         config = OmegaConf.load(args.config)
 
-        # Resolve device.
+        # ---- Device auto-detection ----
         if args.device is not None:
             device = torch.device(args.device)
         elif torch.cuda.is_available():
@@ -171,13 +199,12 @@ def main() -> None:
             device = torch.device("cpu")
         logger.info("Using device: %s", device)
 
-        # Load normalizer.
+        # ---- Load normalizer ----
         normalizer = Normalizer()
         normalizer.load(norm_path)
-        norm_proxy = _create_normalizer_proxy(normalizer)
-
-        # Create data module.
-        data_module = BPCFNODataModule(config, normalizer=norm_proxy)
+        # ---- Create data module (num_workers=0 for Windows) ----
+        # Dataset accesses normalizer.stats directly (no proxy needed)
+        data_module = BPCFNODataModule(config, normalizer=normalizer)
         data_module.setup(stage="fit")
         train_loader = data_module.train_dataloader()
         val_loader = data_module.val_dataloader()
@@ -188,9 +215,14 @@ def main() -> None:
             len(val_loader),
         )
 
-        # Create model and load Phase 1 weights.
+        # ---- Create model and load Phase 1 weights ----
         model = BPC_FNO_A(config).to(device)
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info("Model created: %d total parameters", total_params)
+
+        # Train ALL model parameters (differential LR applied in optimizer).
         optimizer = _build_optimizer(model, config)
+        scheduler = _build_scheduler(optimizer, config, steps_per_epoch)
 
         logger.info("Loading Phase 1 checkpoint from %s", phase1_path)
         ckpt_meta = load_checkpoint(
@@ -202,7 +234,7 @@ def main() -> None:
             ckpt_meta["phase"],
         )
 
-        # Loss modules.
+        # ---- Loss modules ----
         consistency_loss_fn = ForwardConsistencyLoss().to(device)
         physics_cfg = OmegaConf.create({
             "voxel_size_cm": config.model.get("grid_size", 32) * 0.5 / config.model.get("grid_size", 32),
@@ -210,7 +242,7 @@ def main() -> None:
         })
         physics_loss_fn = MonodomainPDELoss(physics_cfg).to(device)
 
-        # Training loop.
+        # ---- Training loop ----
         n_epochs: int = int(config.training.phase2_epochs)
         grad_clip: float = float(config.training.get("grad_clip_norm", 1.0))
         best_val_loss = float("inf")
@@ -238,8 +270,8 @@ def main() -> None:
             for batch in train_loader:
                 J_i = batch["J_i"].to(device)
                 geometry = batch["geometry"].to(device)
-                B_obs = batch["B_mig"].to(device)
-                B_clean = batch["B_mig_clean"].to(device)
+                B_obs = batch["B_noisy"].to(device)
+                B_clean = batch["B_true"].to(device)
 
                 outputs = model(batch={
                     "J_i": J_i, "geometry": geometry, "B_mig": B_obs,
@@ -284,6 +316,7 @@ def main() -> None:
                 if grad_clip > 0:
                     nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                scheduler.step()
 
                 epoch_losses["total"] += total_loss.item()
                 epoch_losses["recon"] += loss_recon.item()
@@ -305,8 +338,8 @@ def main() -> None:
                 for batch in val_loader:
                     J_i = batch["J_i"].to(device)
                     geometry = batch["geometry"].to(device)
-                    B_obs = batch["B_mig"].to(device)
-                    B_clean = batch["B_mig_clean"].to(device)
+                    B_obs = batch["B_noisy"].to(device)
+                    B_clean = batch["B_true"].to(device)
 
                     outputs = model(batch={
                         "J_i": J_i, "geometry": geometry, "B_mig": B_obs,
@@ -320,11 +353,13 @@ def main() -> None:
                     n_val += 1
 
             avg_val_loss = val_loss / max(n_val, 1)
+            current_lr = optimizer.param_groups[0]["lr"]
 
+            # Log ALL loss terms every epoch.
             logger.info(
                 "Epoch %d/%d  total=%.6f  recon=%.6f  fwd=%.6f  "
                 "kl=%.6f  cons=%.6f  phys=%.6f  val=%.6f  "
-                "lam_p=%.4f lam_c=%.4f",
+                "lam_p=%.4f  lam_c=%.4f  lr=%.2e",
                 epoch, n_epochs,
                 epoch_losses["total"],
                 epoch_losses["recon"],
@@ -335,9 +370,10 @@ def main() -> None:
                 avg_val_loss,
                 lam_physics,
                 lam_consistency,
+                current_lr,
             )
 
-            # Save best checkpoint.
+            # Save best checkpoint by val_loss.
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 ckpt_path = Path(args.checkpoint_dir) / "phase2_best.pt"
