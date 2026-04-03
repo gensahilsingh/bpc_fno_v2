@@ -13,6 +13,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
+from bpc_fno.utils.data_paths import resolve_required_data_dir, validate_sample_data_dir
 from bpc_fno.utils.normalization import Normalizer
 
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +30,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--data-dir", default=None,
-        help="Override synthetic data directory (default: from config)",
+        help="Override synthetic data directory (required unless config.data.data_dir is set)",
     )
     parser.add_argument(
         "--output", default=None,
@@ -45,24 +46,17 @@ def main() -> None:
     try:
         config = OmegaConf.load(args.config)
 
-        data_dir = args.data_dir or config.data.synthetic_dir
+        data_path = resolve_required_data_dir(config, args.data_dir)
         output_path = args.output or str(
             Path(config.data.processed_dir) / "normalization.json"
         )
 
-        data_path = Path(data_dir)
-        if not data_path.exists():
-            logger.error(
-                "Data directory does not exist: %s. "
-                "Run scripts/generate_synthetic.py first.",
-                data_path,
-            )
-            sys.exit(1)
+        validate_sample_data_dir(data_path)
 
         # Create normalizer and fit on training data.
-        logger.info("Fitting normalizer on data in %s", data_dir)
+        logger.info("Fitting normalizer on data in %s", data_path)
         normalizer = Normalizer()
-        normalizer.fit(data_dir)
+        normalizer.fit(data_path)
 
         # Save statistics.
         normalizer.save(output_path)

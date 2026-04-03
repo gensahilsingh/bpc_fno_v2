@@ -1,0 +1,14 @@
+extends: data_gen_eikonal.yaml
+
+simulation:
+  pipeline: monodomain
+  backend: opencarp
+  grid_size: 32
+  n_samples: 15000
+  output_dir: data/synthetic_monodomain_prod
+  save_vm: false
+  smoke_only: false
+
+monodomain:
+  dt_ms: 0.05
+  total_time_ms: 150.0

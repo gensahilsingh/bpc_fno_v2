@@ -62,10 +62,12 @@ class InverseEncoder(nn.Module, InverseEncoderInterface):
         self.grid_size = grid_size
         self.latent_dim = latent_dim
 
-        # B-field projection: flatten sensor readings into a 3-D feature volume
-        # via an MLP that outputs a small 4^3 volume, then trilinear-upsample.
+        # B-field projection: flatten sensor readings into a 3-D feature volume.
+        # Input size: S*T where S=n_sensors_total, T=n_output_timesteps.
+        n_output_timesteps: int = int(config.model.get("n_output_timesteps", 1))
+        b_input_size = n_sensors_total * n_output_timesteps
         self.b_projection = nn.Sequential(
-            nn.Linear(n_sensors_total, 1024),
+            nn.Linear(b_input_size, 1024),
             nn.GELU(),
             nn.Linear(1024, c_hidden * 4 * 4 * 4),
         )
@@ -94,7 +96,7 @@ class InverseEncoder(nn.Module, InverseEncoderInterface):
         """Encode observed B-field and geometry into VAE latent parameters.
 
         Args:
-            B_obs: (B, N_sensors*3)
+            B_obs: (B, S) or (B, S, T) — flattened to (B, S*T) internally
             geometry: (B, 4, N, N, N)
 
         Returns:

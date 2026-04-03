@@ -33,6 +33,16 @@ class Normalizer:
     def __init__(self) -> None:
         self.stats: dict[str, list[float]] = {}
 
+    @staticmethod
+    def _sample_id_from_path(path: Path) -> int | None:
+        stem = path.stem
+        if not stem.startswith("sample_"):
+            return None
+        try:
+            return int(stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
     # ------------------------------------------------------------------
     # Fitting
     # ------------------------------------------------------------------
@@ -49,8 +59,8 @@ class Normalizer:
         **B statistics** use all values (no masking needed).
 
         The method walks *data_dir* for ``*.h5`` / ``*.hdf5`` files.  A
-        sample belongs to the training split when its zero-based index
-        (in sorted filename order) satisfies ``idx % 10 in {0..7}``.
+        sample belongs to the training split when its parsed sample ID from
+        ``sample_XXXXX`` satisfies ``sample_id % 10 in {0..7}``.
 
         Expected HDF5 dataset layout per file:
         * ``J_i``  -- shape ``(T, N, N, N, 3)``
@@ -70,9 +80,28 @@ class Normalizer:
                 f"No HDF5 files found in {data_path}"
             )
 
-        train_files = [
-            f for idx, f in enumerate(h5_files) if idx % 10 in range(8)
-        ]
+        train_files: list[Path] = []
+        skipped_files = 0
+        for fpath in h5_files:
+            sample_id = self._sample_id_from_path(fpath)
+            if sample_id is None:
+                skipped_files += 1
+                logger.warning(
+                    "Skipping file without parseable sample ID for normalization split: %s",
+                    fpath,
+                )
+                continue
+            if sample_id % 10 in range(8):
+                train_files.append(fpath)
+        if skipped_files:
+            logger.info(
+                "Skipped %d file(s) without parseable sample IDs during normalization split selection.",
+                skipped_files,
+            )
+        if not train_files:
+            raise RuntimeError(
+                f"No training-split sample_XXXXX files found in {data_path}"
+            )
         logger.info(
             "Fitting normalizer on %d / %d files (training split).",
             len(train_files),
@@ -149,12 +178,13 @@ class Normalizer:
                 if "B_mig" in hf:
                     ds_b = hf["B_mig"]
                     T_total_b = ds_b.shape[0]
-                    t_indices_b = np.linspace(
-                        0, T_total_b - 1, n_time_samples, dtype=int
-                    )
-                    b_data = np.asarray(
-                        ds_b[t_indices_b], dtype=np.float64
-                    )
+                    if T_total_b <= n_time_samples:
+                        b_data = np.asarray(ds_b, dtype=np.float64)
+                    else:
+                        t_indices_b = np.unique(
+                            np.linspace(0, T_total_b - 1, n_time_samples, dtype=int)
+                        )
+                        b_data = np.asarray(ds_b[t_indices_b], dtype=np.float64)
                     b_flat = b_data.reshape(-1, b_data.shape[-1])
                     n_ch = b_flat.shape[1]
 

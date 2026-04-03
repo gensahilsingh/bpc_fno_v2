@@ -1,0 +1,4 @@
+extends: data_gen_opencarp_prod.yaml
+
+simulation:
+  output_dir: data/synthetic_monodomain_cloud

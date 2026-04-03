@@ -68,6 +68,26 @@ class LossManager:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _get_forward_target(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return the clean B-field target when available, else fall back safely."""
+        for key in ("B_true", "B_mig_clean", "B_mig", "B_obs"):
+            if key in batch:
+                return batch[key]
+        raise KeyError(
+            "Batch must contain one of: 'B_true', 'B_mig_clean', 'B_mig', or 'B_obs'."
+        )
+
+    @staticmethod
+    def _get_observed_B(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return the observed/noisy B-field used for inverse inference paths."""
+        for key in ("B_obs", "B_mig", "B_true", "B_mig_clean"):
+            if key in batch:
+                return batch[key]
+        raise KeyError(
+            "Batch must contain one of: 'B_obs', 'B_mig', 'B_true', or 'B_mig_clean'."
+        )
+
+    @staticmethod
     def forward_loss(B_pred: torch.Tensor, B_true: torch.Tensor) -> torch.Tensor:
         """MSE between predicted and true B-field.
 
@@ -114,39 +134,43 @@ class LossManager:
     ) -> torch.Tensor:
         """Physics residual: mean(div(J_i)^2) via central finite differences.
 
-        Penalises violation of current conservation (div(J_i) ~ 0 in
-        quasi-static tissue).  Uses second-order central differences with
-        zero-valued boundaries.
+        Current-conservation loss (div J ~ 0 in quasi-static tissue).
+        Handles both (B, 3, N, N, N) and (B, 3, T, N, N, N).
 
         Args:
-            J_i_hat: (B, 3, N, N, N) predicted current density
-                     (channels: J_x, J_y, J_z).
+            J_i_hat: (B, 3, N, N, N) or (B, 3, T, N, N, N).
             voxel_size_cm: Spatial step in cm.
-
-        Returns:
-            Scalar mean-squared-divergence loss.
         """
+        if J_i_hat.ndim == 6:
+            # Time-series: merge B and T dims
+            B, C, T, N1, N2, N3 = J_i_hat.shape
+            J_flat = J_i_hat.permute(0, 2, 1, 3, 4, 5).reshape(B * T, C, N1, N2, N3)
+            return LossManager._physics_residual_3d(J_flat, voxel_size_cm)
+        return LossManager._physics_residual_3d(J_i_hat, voxel_size_cm)
+
+    @staticmethod
+    def _physics_residual_3d(
+        J_i: torch.Tensor, voxel_size_cm: float
+    ) -> torch.Tensor:
+        """Compute div(J)^2 loss on (B, 3, N, N, N) tensors."""
         inv_2h = 1.0 / (2.0 * voxel_size_cm)
 
-        # dJ_x / dx  — central differences along spatial dim 2
-        dJx_dx = torch.zeros_like(J_i_hat[:, 0:1])
+        dJx_dx = torch.zeros_like(J_i[:, 0:1])
         dJx_dx[:, :, 1:-1, :, :] = (
-            J_i_hat[:, 0:1, 2:, :, :] - J_i_hat[:, 0:1, :-2, :, :]
+            J_i[:, 0:1, 2:, :, :] - J_i[:, 0:1, :-2, :, :]
         ) * inv_2h
 
-        # dJ_y / dy  — central differences along spatial dim 3
-        dJy_dy = torch.zeros_like(J_i_hat[:, 0:1])
+        dJy_dy = torch.zeros_like(J_i[:, 0:1])
         dJy_dy[:, :, :, 1:-1, :] = (
-            J_i_hat[:, 1:2, :, 2:, :] - J_i_hat[:, 1:2, :, :-2, :]
+            J_i[:, 1:2, :, 2:, :] - J_i[:, 1:2, :, :-2, :]
         ) * inv_2h
 
-        # dJ_z / dz  — central differences along spatial dim 4
-        dJz_dz = torch.zeros_like(J_i_hat[:, 0:1])
+        dJz_dz = torch.zeros_like(J_i[:, 0:1])
         dJz_dz[:, :, :, :, 1:-1] = (
-            J_i_hat[:, 2:3, :, :, 2:] - J_i_hat[:, 2:3, :, :, :-2]
+            J_i[:, 2:3, :, :, 2:] - J_i[:, 2:3, :, :, :-2]
         ) * inv_2h
 
-        div_J = dJx_dx + dJy_dy + dJz_dz  # (B, 1, N, N, N)
+        div_J = dJx_dx + dJy_dy + dJz_dz
         return (div_J ** 2).mean()
 
     @staticmethod
@@ -187,7 +211,8 @@ class LossManager:
         dict
             Contains individual loss values and ``'total'`` scalar tensor.
         """
-        L_forward = self.forward_loss(outputs["B_pred"], batch["B_obs"])
+        B_target = self._get_forward_target(batch)
+        L_forward = self.forward_loss(outputs["B_pred"], B_target)
 
         return {
             "L_data_forward": L_forward,
@@ -239,7 +264,9 @@ class LossManager:
         result: dict[str, torch.Tensor | float] = {}
 
         # --- L_data_forward: MSE(B_pred, B_true) ---
-        L_forward = self.forward_loss(outputs["B_pred"], batch["B_obs"])
+        B_target = self._get_forward_target(batch)
+        B_obs = self._get_observed_B(batch)
+        L_forward = self.forward_loss(outputs["B_pred"], B_target)
         result["L_data_forward"] = L_forward
 
         # --- L_data_recon: MSE(J_i_hat, J_i_true) ---
@@ -277,7 +304,7 @@ class LossManager:
             for p, grad_flag in fwd_params_grad_state:
                 p.requires_grad_(grad_flag)
 
-            L_consistency = self.consistency_loss(B_check, batch["B_obs"])
+            L_consistency = self.consistency_loss(B_check, B_obs)
         else:
             L_consistency = torch.tensor(
                 0.0,

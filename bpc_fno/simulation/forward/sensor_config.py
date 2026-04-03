@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 from omegaconf import DictConfig
 
+from bpc_fno.simulation.grid import resolve_grid_shape
+
 
 # KCD 4-sensor array layout (cm) — fixed hardware geometry.
 _KCD_SENSOR_OFFSETS_CM: np.ndarray = np.array(
@@ -54,7 +56,7 @@ class SensorConfig:
         )
 
         # Grid geometry for centering the virtual sensor array.
-        self.grid_size: int = int(config.simulation.grid_size)
+        self.grid_shape: tuple[int, int, int] = resolve_grid_shape(config)
         self.voxel_size_cm: float = float(config.simulation.voxel_size_cm)
 
     # ------------------------------------------------------------------
@@ -103,14 +105,16 @@ class SensorConfig:
         spacing = self.virtual_sensor_spacing_cm
 
         # Centre of the tissue slab in the x-z plane.
-        tissue_centre = self.grid_size * self.voxel_size_cm / 2.0
+        tissue_centre_x = self.grid_shape[0] * self.voxel_size_cm / 2.0
+        tissue_centre_z = self.grid_shape[2] * self.voxel_size_cm / 2.0
 
         # 1-D sensor coordinates centred at tissue_centre.
         offsets = np.arange(n, dtype=np.float64) - (n - 1) / 2.0
-        coords_1d = tissue_centre + offsets * spacing  # shape (n,)
+        x_coords = tissue_centre_x + offsets * spacing
+        z_coords = tissue_centre_z + offsets * spacing
 
         # Meshgrid in x-z; y is constant at sensor_height_cm.
-        xg, zg = np.meshgrid(coords_1d, coords_1d, indexing="ij")
+        xg, zg = np.meshgrid(x_coords, z_coords, indexing="ij")
         positions = np.stack(
             [
                 xg.ravel(),

@@ -18,11 +18,13 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 
 from bpc_fno.data.data_module import BPCFNODataModule
+from bpc_fno.evaluation.metrics import physics_residual_metric
 from bpc_fno.models.bpc_fno_a import BPC_FNO_A
 from bpc_fno.utils.checkpointing import load_checkpoint, validate_checkpoint
+from bpc_fno.utils.data_paths import resolve_required_data_dir, validate_sample_data_dir
 from bpc_fno.utils.normalization import Normalizer
 
 logging.basicConfig(level=logging.INFO)
@@ -69,32 +71,6 @@ def _uq_coverage(
     upper = J_mean + z_level * J_std
     inside = (J_true >= lower) & (J_true <= upper)
     return float(inside.mean())
-
-
-def _create_normalizer_proxy(normalizer: Normalizer) -> object:
-    """Create a normalizer proxy matching SyntheticMIGDataset protocol."""
-
-    class _NormalizerProxy:
-        def __init__(self, norm: Normalizer) -> None:
-            self._norm = norm
-
-        def normalize(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
-            if key == "J_i":
-                return self._norm.normalize_J_i(tensor)
-            if key in ("B_mig", "B_mig_clean"):
-                return self._norm.normalize_B(tensor)
-            if key == "geometry":
-                return self._norm.normalize_geometry(tensor)
-            return tensor
-
-        def denormalize(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
-            if key == "J_i":
-                return self._norm.denormalize_J_i(tensor)
-            if key in ("B_mig", "B_mig_clean"):
-                return self._norm.denormalize_B(tensor)
-            return tensor
-
-    return _NormalizerProxy(normalizer)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +193,10 @@ def main() -> None:
         help="Directory to save evaluation outputs",
     )
     parser.add_argument(
+        "--data-dir", default=None,
+        help="Synthetic data directory (required unless config.data.data_dir is set)",
+    )
+    parser.add_argument(
         "--n-uq-samples", type=int, default=None,
         help="Override number of UQ posterior samples (default: from config)",
     )
@@ -247,6 +227,8 @@ def main() -> None:
 
     try:
         config = OmegaConf.load(args.config)
+        data_dir = resolve_required_data_dir(config, args.data_dir)
+        validate_sample_data_dir(data_dir)
 
         # Resolve device.
         if args.device is not None:
@@ -274,13 +256,13 @@ def main() -> None:
         # Load normalizer.
         normalizer = Normalizer()
         normalizer.load(norm_path)
-        norm_proxy = _create_normalizer_proxy(normalizer)
 
         # Create data module (test split).
-        data_module = BPCFNODataModule(config, normalizer=norm_proxy)
+        data_module = BPCFNODataModule(config, normalizer=normalizer)
         data_module.setup(stage="test")
         test_loader = data_module.test_dataloader()
         logger.info("Test set: %d batches", len(test_loader))
+        logger.info("Evaluation data directory: %s", data_dir)
 
         # Create model and load weights.
         model = BPC_FNO_A(config).to(device)
@@ -303,15 +285,25 @@ def main() -> None:
 
         forward_l2_errors: list[float] = []
         reconstruction_rs: list[float] = []
+        physics_residuals: list[float] = []
         uq_coverages: list[float] = []
         sample_predictions: list[dict[str, np.ndarray]] = []
+        voxel_size_cm = float(
+            OmegaConf.select(config, "simulation.voxel_size_cm", default=0.5)
+        )
 
         with torch.no_grad():
             for batch in test_loader:
                 J_i = batch["J_i"].to(device)
                 geometry = batch["geometry"].to(device)
-                B_obs = batch["B_mig"].to(device)
-                B_clean = batch["B_mig_clean"].to(device)
+                if "B_obs" in batch:
+                    B_obs = batch["B_obs"].to(device)
+                else:
+                    B_obs = batch["B_mig"].to(device)
+                if "B_true" in batch:
+                    B_clean = batch["B_true"].to(device)
+                else:
+                    B_clean = batch["B_mig_clean"].to(device)
                 batch_size = J_i.shape[0]
 
                 # Forward error.
@@ -340,6 +332,13 @@ def main() -> None:
                         j_true_np.reshape(-1, 1),
                     )
                     reconstruction_rs.append(float(r_vals.mean()))
+                    physics_residuals.append(
+                        float(
+                            physics_residual_metric(
+                                J_mean[b : b + 1], voxel_size_cm
+                            ).item()
+                        )
+                    )
 
                     # UQ coverage (95% CI).
                     cov = _uq_coverage(j_true_np, j_mean_np, j_std_np)
@@ -369,6 +368,8 @@ def main() -> None:
             "per_sample_forward_l2": [float(x) for x in forward_l2_errors],
             "reconstruction_r_mean": float(np.mean(reconstruction_rs)),
             "reconstruction_r_std": float(np.std(reconstruction_rs)),
+            "physics_residual_mean": float(np.mean(physics_residuals)),
+            "physics_residual_std": float(np.std(physics_residuals)),
             "uq_coverage_95": float(np.mean(uq_coverages)),
             "uq_coverage_95_std": float(np.std(uq_coverages)),
         }
@@ -378,6 +379,7 @@ def main() -> None:
         results["pass_reconstruction_r"] = (
             results["reconstruction_r_mean"] > recon_r_thr
         )
+        results["pass_physics"] = results["physics_residual_mean"] < phys_thr
         results["pass_uq_coverage"] = results["uq_coverage_95"] >= uq_cov_tgt
 
         # Compute coverage at multiple levels for calibration plot.
@@ -409,6 +411,13 @@ def main() -> None:
             results["reconstruction_r_std"],
             recon_r_thr,
             "PASS" if results["pass_reconstruction_r"] else "FAIL",
+        )
+        logger.info(
+            "Physics residual:    %.4f +/- %.4f  (threshold: %.4f)  [%s]",
+            results["physics_residual_mean"],
+            results["physics_residual_std"],
+            phys_thr,
+            "PASS" if results["pass_physics"] else "FAIL",
         )
         logger.info(
             "UQ coverage (95%%):   %.4f +/- %.4f  (target: %.4f)   [%s]",

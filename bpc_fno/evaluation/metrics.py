@@ -17,6 +17,26 @@ from bpc_fno.models.bpc_fno_a import BPC_FNO_A
 logger = logging.getLogger(__name__)
 
 
+def _get_forward_target(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return the clean B-field target when available."""
+    for key in ("B_true", "B_mig_clean", "B_mig", "B_obs"):
+        if key in batch:
+            return batch[key]
+    raise KeyError(
+        "Batch must contain one of: 'B_true', 'B_mig_clean', 'B_mig', or 'B_obs'."
+    )
+
+
+def _get_observed_B(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return the observed/noisy B-field used by the inverse model."""
+    for key in ("B_obs", "B_mig", "B_true", "B_mig_clean"):
+        if key in batch:
+            return batch[key]
+    raise KeyError(
+        "Batch must contain one of: 'B_obs', 'B_mig', 'B_true', or 'B_mig_clean'."
+    )
+
+
 # ======================================================================
 # Standalone metric functions
 # ======================================================================
@@ -85,6 +105,10 @@ def physics_residual_metric(
     Returns:
         Scalar tensor — mean |div(J)| over all voxels and batch elements.
     """
+    if J_i.ndim == 6:
+        B, C, T, N1, N2, N3 = J_i.shape
+        J_i = J_i.permute(0, 2, 1, 3, 4, 5).reshape(B * T, C, N1, N2, N3)
+
     inv_2h = 1.0 / (2.0 * voxel_size_cm)
 
     dJx_dx = torch.zeros_like(J_i[:, 0:1])
@@ -236,7 +260,7 @@ class MetricsComputer:
         Args:
             model_output: Dict from ``model.forward(batch)`` containing at
                 least ``J_i_hat``, ``B_pred``.
-            batch: Original data batch with keys ``J_i``, ``B_mig``,
+            batch: Original data batch with keys ``J_i``, B-field targets,
                 ``geometry``.
             model: The model instance (used for posterior sampling).
 
@@ -245,7 +269,8 @@ class MetricsComputer:
             logger / wandb.
         """
         J_i_true: torch.Tensor = batch["J_i"]
-        B_true: torch.Tensor = batch["B_mig"]
+        B_true: torch.Tensor = _get_forward_target(batch)
+        B_obs: torch.Tensor = _get_observed_B(batch)
         geometry: torch.Tensor = batch["geometry"]
         J_i_hat: torch.Tensor = model_output["J_i_hat"]
         B_pred: torch.Tensor = model_output["B_pred"]
@@ -273,7 +298,7 @@ class MetricsComputer:
         # -- UQ metrics via posterior sampling --
         try:
             recon = model.reconstruct(
-                B_true, geometry, n_samples=self.uq_n_samples
+                B_obs, geometry, n_samples=self.uq_n_samples
             )
             # Collect individual samples for UQ analysis
             mu = recon["mu"]

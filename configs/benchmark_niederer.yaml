@@ -1,0 +1,27 @@
+extends: data_gen_opencarp_prod.yaml
+
+simulation:
+  pipeline: monodomain
+  backend: opencarp
+  grid_shape: [40, 14, 6]
+  voxel_size_cm: 0.05
+  n_samples: 1
+  output_dir: data/benchmark_niederer
+  save_vm: true
+  stored_timesteps: 300
+
+ionic:
+  pacing_cycle_length_ms_range: [1000, 1000]
+
+tissue:
+  sigma_il: 1.334e-3
+  sigma_it: 1.76e-4
+  conduction_velocity_scale_range: [1.0, 1.0]
+  fibrosis_max_density: 0.0
+
+monodomain:
+  dt_ms: 0.05
+  total_time_ms: 30.0
+  stimulus_start_ms: 0.0
+  stimulus_radius_cm: 0.15
+  activation_threshold_mV: -40.0

@@ -135,9 +135,17 @@ class TT2006Runner:
             if var.qname() == key:
                 return key
 
+        normalized = key.lower().replace("_", "")
+
         # Suffix match.
         for var in model.variables(deep=True):
-            if var.name() == key or var.qname().endswith(f".{key}"):
+            var_name = var.name()
+            qname = var.qname()
+            if var_name == key or qname.endswith(f".{key}"):
+                return qname
+            if var_name.lower().replace("_", "") == normalized:
+                return qname
+            if qname.split(".")[-1].lower().replace("_", "") == normalized:
                 return var.qname()
 
         raise KeyError(

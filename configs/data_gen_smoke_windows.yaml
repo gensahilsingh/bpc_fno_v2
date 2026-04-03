@@ -1,0 +1,14 @@
+extends: data_gen_eikonal.yaml
+
+simulation:
+  pipeline: monodomain
+  backend: windows_hybrid
+  grid_size: 16
+  n_samples: 100
+  output_dir: data/synthetic_smoke_windows
+  save_vm: true
+  smoke_only: true
+
+monodomain:
+  dt_ms: 0.1
+  total_time_ms: 150.0

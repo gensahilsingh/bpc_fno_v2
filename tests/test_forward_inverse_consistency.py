@@ -62,10 +62,13 @@ def model(config: SimpleNamespace) -> BPC_FNO_A:
 def sample_batch() -> dict[str, torch.Tensor]:
     torch.manual_seed(42)
     N = _GRID_SIZE
+    T = _N_TIMESTEPS
+    B_obs = torch.randn(_BATCH_SIZE, _N_SENSORS_TOTAL, _N_TIMESTEPS)
     return {
-        "J_i": torch.randn(_BATCH_SIZE, 3, N, N, N),
+        "J_i": torch.randn(_BATCH_SIZE, 3, T, N, N, N),
         "geometry": torch.randn(_BATCH_SIZE, 4, N, N, N),
-        "B_mig": torch.randn(_BATCH_SIZE, _N_SENSORS_TOTAL, _N_TIMESTEPS),
+        "B_obs": B_obs,
+        "B_mig": B_obs.clone(),
     }
 
 
@@ -93,21 +96,38 @@ class TestForwardThenInverse:
         # Verify shapes
         B = _BATCH_SIZE
         N = _GRID_SIZE
-        assert result["B_pred"].shape == (B, _N_SENSORS_TOTAL, _N_TIMESTEPS)
-        assert result["J_i_hat"].shape == (B, 3, N, N, N)
+        T = _N_TIMESTEPS
+        assert result["B_pred"].shape == (B, _N_SENSORS_TOTAL, T)
+        assert result["J_i_hat"].shape == (B, 3, T, N, N, N)
         assert result["mu"].shape == (B, _LATENT_DIM)
         assert result["log_var"].shape == (B, _LATENT_DIM)
         assert result["z"].shape == (B, _LATENT_DIM)
+
+    def test_forward_accepts_legacy_b_mig_key(
+        self, model: BPC_FNO_A, sample_batch: dict[str, torch.Tensor]
+    ) -> None:
+        model.eval()
+        legacy_batch = {
+            "J_i": sample_batch["J_i"],
+            "geometry": sample_batch["geometry"],
+            "B_mig": sample_batch["B_mig"],
+        }
+        result = model(legacy_batch)
+        assert result["B_pred"].shape == (
+            _BATCH_SIZE, _N_SENSORS_TOTAL, _N_TIMESTEPS
+        )
 
     def test_reconstruct_method(
         self, model: BPC_FNO_A, sample_batch: dict[str, torch.Tensor]
     ) -> None:
         result = model.reconstruct(
-            B_obs=sample_batch["B_mig"],
+            B_obs=sample_batch["B_obs"],
             geometry=sample_batch["geometry"],
             n_samples=3,
         )
-        assert result["J_i_mean"].shape == (_BATCH_SIZE, 3, _GRID_SIZE, _GRID_SIZE, _GRID_SIZE)
+        assert result["J_i_mean"].shape == (
+            _BATCH_SIZE, 3, _N_TIMESTEPS, _GRID_SIZE, _GRID_SIZE, _GRID_SIZE
+        )
         assert result["J_i_std"].shape == result["J_i_mean"].shape
         # With n_samples > 1, std should be non-zero (different posterior samples)
         # (Could be zero if model is degenerate, but very unlikely with random init)

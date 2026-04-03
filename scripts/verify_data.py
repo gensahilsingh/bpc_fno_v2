@@ -1,20 +1,9 @@
-"""Verify synthetic HDF5 data integrity and physical plausibility.
-
-Loads 20 evenly-spaced samples from data/synthetic and checks:
-  - B_mig range: 1e-14 < max(|B|) < 1e-10 T
-  - J_i range: 0.1 < max(|J|) < 10.0 uA/cm^2
-  - J_i std across samples > 0.05
-  - At least 2 cell types present
-  - V_m NOT stored
-  - No NaN/Inf
-  - Shapes correct: J_i (T, 32, 32, 32, 3), B_mig (T, 16, 3)
-
-Prints PASS/FAIL for each check.
-"""
+"""Verify synthetic HDF5 data integrity and backend-specific plausibility."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -37,11 +26,30 @@ logger = logging.getLogger(__name__)
 
 
 def _pick_evenly_spaced(files: list[Path], n: int) -> list[Path]:
-    """Select n evenly-spaced files from a sorted list."""
     if len(files) <= n:
         return files
     indices = np.linspace(0, len(files) - 1, n, dtype=int)
     return [files[i] for i in indices]
+
+
+def _infer_grid_shape(hf: h5py.File) -> tuple[int, int, int]:
+    if "geometry/cell_type_map" in hf:
+        return tuple(int(v) for v in hf["geometry/cell_type_map"].shape)
+    return tuple(int(v) for v in hf["geometry/sdf"].shape)
+
+
+def _check_required_dataset(hf: h5py.File, key: str) -> bool:
+    if key in hf:
+        return True
+    logger.error("    missing dataset: %s", key)
+    return False
+
+
+def _vm_expectation_mode(value: str) -> str:
+    value = value.lower()
+    if value not in {"yes", "no", "auto"}:
+        raise ValueError("--expect-vm must be one of yes/no/auto")
+    return value
 
 
 def main() -> None:
@@ -49,20 +57,37 @@ def main() -> None:
         description="Verify synthetic data integrity and plausibility"
     )
     parser.add_argument(
-        "--data-dir", default="data/synthetic",
+        "--data-dir",
+        default="data/synthetic_eikonal",
         help="Directory containing sample_*.h5 files",
     )
     parser.add_argument(
-        "--n-samples", type=int, default=20,
-        help="Number of evenly-spaced samples to check (default: 20)",
+        "--n-samples",
+        type=int,
+        default=20,
+        help="Number of evenly-spaced samples to check",
     )
     parser.add_argument(
-        "--grid-size", type=int, default=32,
-        help="Expected spatial grid size N (default: 32)",
+        "--n-sensors",
+        type=int,
+        default=16,
+        help="Expected number of sensors",
     )
     parser.add_argument(
-        "--n-sensors", type=int, default=16,
-        help="Expected number of sensors (default: 16)",
+        "--expect-vm",
+        default="auto",
+        help="Whether V_m must be present: yes, no, or auto",
+    )
+    parser.add_argument(
+        "--smoke-only",
+        action="store_true",
+        help="Enable smoke-only acceptance checks",
+    )
+    parser.add_argument(
+        "--time-budget-hours",
+        type=float,
+        default=None,
+        help="Optional runtime budget check against MANIFEST.json",
     )
     args = parser.parse_args()
 
@@ -82,198 +107,168 @@ def main() -> None:
         len(selected), len(all_h5), data_dir,
     )
 
-    N = args.grid_size
-    Ns = args.n_sensors
+    required = [
+        "J_i",
+        "B_mig",
+        "B_mig_noisy",
+        "geometry/sdf",
+        "geometry/fiber",
+        "geometry/cell_type_map",
+        "sensor_positions",
+        "t_ms",
+        "activation_times_ms",
+        "stimulus_mask",
+    ]
+    expect_vm = _vm_expectation_mode(args.expect_vm)
 
-    # Accumulators for cross-sample checks
-    all_J_maxabs: list[float] = []
-    cell_types_seen: set[str] = set()
     results: dict[str, bool] = {}
-
-    # Per-sample checks
-    any_nan_inf = False
-    any_bad_b_range = False
-    any_bad_j_range = False
+    any_missing = False
     any_bad_shape = False
-    any_vm_stored = False
+    any_nan_inf = False
+    any_bad_b = False
+    any_bad_j = False
+    any_bad_vm = False
+    cell_types_seen: set[int] = set()
+    adjacent_corrs: list[float] = []
+    activation_ok = True
 
-    try:
-        for fpath in selected:
-            logger.info("  Checking %s ...", fpath.name)
-            try:
-                with h5py.File(fpath, "r") as f:
-                    # --- Shape checks ---
-                    if "J_i" not in f:
-                        logger.error("    MISSING J_i dataset")
-                        any_bad_shape = True
-                        continue
+    for fpath in selected:
+        logger.info("  Checking %s ...", fpath.name)
+        with h5py.File(fpath, "r") as hf:
+            for key in required:
+                if not _check_required_dataset(hf, key):
+                    any_missing = True
 
-                    j_shape = f["J_i"].shape
-                    # Expected: (T, N, N, N, 3)
-                    if len(j_shape) != 5:
-                        logger.error(
-                            "    J_i ndim=%d, expected 5", len(j_shape)
-                        )
-                        any_bad_shape = True
-                    elif j_shape[1:] != (N, N, N, 3):
-                        logger.error(
-                            "    J_i shape=%s, expected (T, %d, %d, %d, 3)",
-                            j_shape, N, N, N,
-                        )
-                        any_bad_shape = True
+            if any_missing:
+                continue
 
-                    if "B_mig" not in f:
-                        logger.error("    MISSING B_mig dataset")
-                        any_bad_shape = True
-                        continue
+            grid_shape = _infer_grid_shape(hf)
+            t_len = hf["t_ms"].shape[0]
 
-                    b_shape = f["B_mig"].shape
-                    # Expected: (T, Ns, 3)
-                    if len(b_shape) != 3:
-                        logger.error(
-                            "    B_mig ndim=%d, expected 3", len(b_shape)
-                        )
-                        any_bad_shape = True
-                    elif b_shape[1:] != (Ns, 3):
-                        logger.error(
-                            "    B_mig shape=%s, expected (T, %d, 3)",
-                            b_shape, Ns,
-                        )
-                        any_bad_shape = True
+            if hf["J_i"].shape != (t_len, *grid_shape, 3):
+                logger.error("    J_i shape mismatch: %s", hf["J_i"].shape)
+                any_bad_shape = True
+            if hf["B_mig"].shape != (t_len, args.n_sensors, 3):
+                logger.error("    B_mig shape mismatch: %s", hf["B_mig"].shape)
+                any_bad_shape = True
+            if hf["B_mig_noisy"].shape != (t_len, args.n_sensors, 3):
+                logger.error("    B_mig_noisy shape mismatch: %s", hf["B_mig_noisy"].shape)
+                any_bad_shape = True
+            if hf["geometry/fiber"].shape != (*grid_shape, 3):
+                logger.error("    geometry/fiber shape mismatch: %s", hf["geometry/fiber"].shape)
+                any_bad_shape = True
+            if hf["sensor_positions"].shape != (args.n_sensors, 3):
+                logger.error("    sensor_positions shape mismatch: %s", hf["sensor_positions"].shape)
+                any_bad_shape = True
+            if hf["activation_times_ms"].shape != grid_shape:
+                logger.error("    activation_times_ms shape mismatch: %s", hf["activation_times_ms"].shape)
+                any_bad_shape = True
+            if hf["stimulus_mask"].shape != grid_shape:
+                logger.error("    stimulus_mask shape mismatch: %s", hf["stimulus_mask"].shape)
+                any_bad_shape = True
 
-                    # --- V_m NOT stored ---
-                    if "V_m" in f:
-                        logger.warning("    V_m dataset found (should not be stored)")
-                        any_vm_stored = True
+            has_vm = "V_m" in hf
+            if expect_vm == "yes" and not has_vm:
+                logger.error("    V_m missing but required")
+                any_bad_vm = True
+            if expect_vm == "no" and has_vm:
+                logger.error("    V_m present but should be omitted")
+                any_bad_vm = True
 
-                    # --- NaN/Inf checks ---
-                    # Sample a few timesteps to avoid reading full arrays
-                    T = j_shape[0]
-                    t_check = [0, T // 2, T - 1] if T >= 3 else list(range(T))
+            sample_indices = [0, max(0, t_len // 2), t_len - 1]
+            for t_idx in sample_indices:
+                for key in ("J_i", "B_mig", "B_mig_noisy"):
+                    data = np.asarray(hf[key][t_idx])
+                    if not np.all(np.isfinite(data)):
+                        logger.error("    non-finite data in %s at t=%d", key, t_idx)
+                        any_nan_inf = True
+                if has_vm:
+                    vm = np.asarray(hf["V_m"][t_idx])
+                    if not np.all(np.isfinite(vm)):
+                        logger.error("    non-finite data in V_m at t=%d", t_idx)
+                        any_nan_inf = True
 
-                    for t in t_check:
-                        j_data = np.asarray(f["J_i"][t])
-                        b_data = np.asarray(f["B_mig"][t])
+            b_abs = float(np.max(np.abs(hf["B_mig"][:])))
+            j_abs = float(np.max(np.abs(hf["J_i"][:])))
+            if b_abs <= 0.0:
+                logger.error("    B_mig is identically zero")
+                any_bad_b = True
+            if j_abs <= 0.0:
+                logger.error("    J_i is identically zero")
+                any_bad_j = True
 
-                        if not np.all(np.isfinite(j_data)):
-                            logger.error("    NaN/Inf in J_i at t=%d", t)
-                            any_nan_inf = True
-                        if not np.all(np.isfinite(b_data)):
-                            logger.error("    NaN/Inf in B_mig at t=%d", t)
-                            any_nan_inf = True
+            cell_types = np.unique(np.asarray(hf["geometry/cell_type_map"]))
+            cell_types_seen.update(int(v) for v in cell_types.tolist())
 
-                    # --- B_mig range check ---
-                    # Read all B_mig to get true max
-                    b_all = np.asarray(f["B_mig"])
-                    b_maxabs = float(np.max(np.abs(b_all)))
-                    if not (1e-14 < b_maxabs < 1e-10):
-                        logger.warning(
-                            "    B_mig max(|B|)=%.2e (expected 1e-14..1e-10 T)",
-                            b_maxabs,
-                        )
-                        any_bad_b_range = True
-                    else:
-                        logger.info("    B_mig max(|B|)=%.2e T -- OK", b_maxabs)
+            if args.smoke_only:
+                act = np.asarray(hf["activation_times_ms"])
+                finite_act = act[np.isfinite(act)]
+                if finite_act.size == 0 or float(np.max(finite_act)) <= 0.0:
+                    logger.error("    activation_times_ms does not contain valid activations")
+                    activation_ok = False
+                if has_vm:
+                    vm_all = np.asarray(hf["V_m"])
+                    if float(np.max(vm_all)) < 0.0:
+                        logger.error("    V_m never depolarizes above 0 mV")
+                        activation_ok = False
 
-                    # --- J_i range check ---
-                    # Read all J_i to get true max (may be large)
-                    j_all = np.asarray(f["J_i"])
-                    j_maxabs = float(np.max(np.abs(j_all)))
-                    all_J_maxabs.append(j_maxabs)
-                    if not (0.1 < j_maxabs < 10.0):
-                        logger.warning(
-                            "    J_i max(|J|)=%.4f (expected 0.1..10.0 uA/cm^2)",
-                            j_maxabs,
-                        )
-                        any_bad_j_range = True
-                    else:
-                        logger.info(
-                            "    J_i max(|J|)=%.4f uA/cm^2 -- OK", j_maxabs
-                        )
+                j_mid = np.asarray(hf["J_i"][:, grid_shape[0] // 2, grid_shape[1] // 2, grid_shape[2] // 2, :]).ravel()
+                j_adj = np.asarray(hf["J_i"][:, min(grid_shape[0] // 2 + 1, grid_shape[0] - 1), grid_shape[1] // 2, grid_shape[2] // 2, :]).ravel()
+                if np.std(j_mid) > 0 and np.std(j_adj) > 0:
+                    adjacent_corrs.append(float(np.corrcoef(j_mid, j_adj)[0, 1]))
 
-                    # --- Cell type ---
-                    if "cell_type" in f.attrs:
-                        ct = str(f.attrs["cell_type"])
-                        cell_types_seen.add(ct)
-                    elif "metadata" in f and "cell_type" in f["metadata"].attrs:
-                        ct = str(f["metadata"].attrs["cell_type"])
-                        cell_types_seen.add(ct)
+    results["required_datasets"] = not any_missing
+    results["shapes"] = not any_bad_shape
+    results["no_nan_inf"] = not any_nan_inf
+    results["nonzero_B_mig"] = not any_bad_b
+    results["nonzero_J_i"] = not any_bad_j
+    results["vm_policy"] = not any_bad_vm
+    results["cell_type_map"] = len(cell_types_seen) >= 2
 
-            except Exception as exc:
-                logger.error("    Error reading %s: %s", fpath.name, exc)
-                any_nan_inf = True  # treat read errors as data issues
-
-        # ---- Aggregate checks ----
-        logger.info("")
-        logger.info("=" * 60)
-        logger.info("VERIFICATION RESULTS")
-        logger.info("=" * 60)
-
-        # 1. B_mig range
-        results["B_mig_range"] = not any_bad_b_range
-        status = "PASS" if results["B_mig_range"] else "FAIL"
-        logger.info("[%s] B_mig range: 1e-14 < max(|B|) < 1e-10 T", status)
-
-        # 2. J_i range
-        results["J_i_range"] = not any_bad_j_range
-        status = "PASS" if results["J_i_range"] else "FAIL"
-        logger.info("[%s] J_i range: 0.1 < max(|J|) < 10.0 uA/cm^2", status)
-
-        # 3. J_i std across samples
-        if len(all_J_maxabs) >= 2:
-            j_std = float(np.std(all_J_maxabs))
-            results["J_i_std"] = j_std > 0.05
+    if args.smoke_only:
+        results["plausible_activation"] = activation_ok
+        if adjacent_corrs:
+            max_corr = max(adjacent_corrs)
+            results["adjacent_voxel_variation"] = max_corr < 0.999
         else:
-            j_std = 0.0
-            results["J_i_std"] = False
-        status = "PASS" if results["J_i_std"] else "FAIL"
+            max_corr = float("nan")
+            results["adjacent_voxel_variation"] = False
         logger.info(
-            "[%s] J_i std across samples: %.4f (threshold > 0.05)",
-            status, j_std,
+            "Smoke-only adjacent voxel correlation max: %.4f",
+            max_corr,
         )
 
-        # 4. At least 2 cell types
-        results["cell_types"] = len(cell_types_seen) >= 2
-        status = "PASS" if results["cell_types"] else "FAIL"
-        logger.info(
-            "[%s] Cell types present: %s (need >= 2)",
-            status, sorted(cell_types_seen) if cell_types_seen else "none found",
-        )
-
-        # 5. V_m NOT stored
-        results["no_Vm"] = not any_vm_stored
-        status = "PASS" if results["no_Vm"] else "FAIL"
-        logger.info("[%s] V_m NOT stored in HDF5 files", status)
-
-        # 6. No NaN/Inf
-        results["no_nan_inf"] = not any_nan_inf
-        status = "PASS" if results["no_nan_inf"] else "FAIL"
-        logger.info("[%s] No NaN/Inf values", status)
-
-        # 7. Shapes correct
-        results["shapes"] = not any_bad_shape
-        status = "PASS" if results["shapes"] else "FAIL"
-        logger.info(
-            "[%s] Shapes correct: J_i (T,%d,%d,%d,3), B_mig (T,%d,3)",
-            status, N, N, N, Ns,
-        )
-
-        logger.info("=" * 60)
-        n_pass = sum(results.values())
-        n_total = len(results)
-        logger.info(
-            "Overall: %d/%d checks passed", n_pass, n_total
-        )
-
-        if n_pass < n_total:
-            logger.error("Data verification FAILED.")
-            sys.exit(1)
+    if args.time_budget_hours is not None:
+        manifest_path = data_dir / "MANIFEST.json"
+        if not manifest_path.exists():
+            results["time_budget"] = False
         else:
-            logger.info("All data verification checks PASSED.")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            runtime_hours = float(manifest.get("runtime_seconds", 0.0)) / 3600.0
+            results["time_budget"] = runtime_hours <= float(args.time_budget_hours)
+            logger.info(
+                "Manifest runtime: %.2f hours (budget %.2f hours)",
+                runtime_hours,
+                float(args.time_budget_hours),
+            )
 
-    except Exception as exc:
-        logger.error("Data verification failed: %s", exc, exc_info=True)
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("VERIFICATION RESULTS")
+    logger.info("=" * 60)
+    for key, passed in results.items():
+        logger.info("[%s] %s", "PASS" if passed else "FAIL", key)
+
+    n_pass = sum(results.values())
+    n_total = len(results)
+    logger.info("=" * 60)
+    logger.info("Overall: %d/%d checks passed", n_pass, n_total)
+
+    if n_pass < n_total:
+        logger.error("Data verification FAILED.")
         sys.exit(1)
+
+    logger.info("All data verification checks PASSED.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,54 @@
+simulation:
+  pipeline: eikonal
+  backend: eikonal
+  grid_size: 32
+  voxel_size_cm: 0.1
+  n_samples: 4000
+  n_workers: 1
+  output_dir: data/synthetic_eikonal
+  save_vm: false
+  stored_timesteps: 100
+  master_seed: 42
+  smoke_only: false
+
+ionic:
+  cellml_url_endo: "https://models.physiomeproject.org/e/80d/ten_tusscher_model_2006_endo.cellml"
+  cellml_url_mid: "https://models.physiomeproject.org/e/80d/ten_tusscher_model_2006_m.cellml"
+  cellml_url_epi: "https://models.physiomeproject.org/e/80d/ten_tusscher_model_2006_epi.cellml"
+  pacing_cycle_length_ms_range: [600, 1200]
+  n_prepacing_beats: 10
+  conductance_scaling_range: [0.7, 1.3]
+  ko_range_mM: [3.5, 6.5]
+
+tissue:
+  layer_fractions: [0.33, 0.33, 0.34]
+  sigma_il: 3.0e-3
+  sigma_it: 3.0e-4
+  sigma_el: 2.0e-3
+  sigma_et: 1.33e-3
+  conduction_velocity_scale_range: [0.6, 1.4]
+  fibrosis_max_density: 0.4
+  fibrosis_blob_sigma_voxels: 3
+
+monodomain:
+  dt_ms: 0.05
+  total_time_ms: 150.0
+  chi_cm_inv: 1400.0
+  Cm_uF_per_cm2: 1.0
+  resting_potential_mV: -85.23
+  activation_threshold_mV: -40.0
+  solver_method: direct
+  stimulus_radius_cm: 0.15
+  stimulus_duration_ms: 2.0
+  stimulus_start_ms: 0.0
+  stimulus_magnitude_uA_cm2: -52.0
+  opencarp_stimulus_strength: 35.71
+  fibrosis_conductivity_scale: 0.0
+
+sensor:
+  virtual_sensor_grid_n: 4
+  virtual_sensor_spacing_cm: 3.0
+  sensor_height_cm: 14.0
+
+noise:
+  white_noise_floor_fT_per_rtHz: 15.0

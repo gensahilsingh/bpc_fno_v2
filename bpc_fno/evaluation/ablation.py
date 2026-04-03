@@ -18,6 +18,8 @@ from torch.utils.data import DataLoader
 
 from bpc_fno.evaluation.metrics import (
     MetricsComputer,
+    _get_forward_target,
+    _get_observed_B,
     pearson_correlation,
     relative_l2_error,
     uq_coverage,
@@ -113,7 +115,7 @@ class AblationEvaluator:
             }
             J_i = batch["J_i"]
             geometry = batch["geometry"]
-            B_true = batch["B_mig"]
+            B_true = _get_forward_target(batch)
 
             B_pred = self.model.forward_only(J_i, geometry)
 
@@ -259,7 +261,7 @@ class AblationEvaluator:
                 }
                 J_i_true = batch["J_i"]
                 geometry = batch["geometry"]
-                B_obs = batch["B_mig"]
+                B_obs = _get_observed_B(batch)
 
                 # Draw posterior samples
                 mu, log_var = self.model.inverse_encoder.encode_to_latent(

@@ -44,3 +44,8 @@ Thumbs.db
 
 # Myokit temp
 C_tmp_mk/
+
+# Local tooling / generated dumps
+.claude/
+CODEBASE_DUMP.txt
+*.tmp

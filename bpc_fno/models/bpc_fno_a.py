@@ -68,27 +68,35 @@ class BPC_FNO_A(nn.Module):
     # Forward passes
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_B_obs(batch: dict[str, Tensor]) -> Tensor:
+        """Resolve the observed B-field from either the new or legacy batch key."""
+        for key in ("B_obs", "B_mig", "B_true"):
+            if key in batch:
+                return batch[key]
+        raise KeyError("Batch must contain one of: 'B_obs', 'B_mig', or 'B_true'.")
+
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Full forward pass through all stages.
 
         Args:
             batch: dict with keys
-                - ``J_i``: (B, 3, N, N, N)
+                - ``J_i``: (B, 3, N, N, N) or (B, 3, T, N, N, N)
                 - ``geometry``: (B, 4, N, N, N)
-                - ``B_mig``: (B, N_sensors*3, T) — observed/simulated B field
+                - ``B_obs`` or legacy ``B_mig``: (B, N_sensors*3[, T])
 
         Returns:
             dict with keys ``B_pred``, ``J_i_hat``, ``mu``, ``log_var``, ``z``.
         """
         J_i = batch["J_i"]
         geometry = batch["geometry"]
-        B_mig = batch["B_mig"]
+        B_obs = self._resolve_B_obs(batch)
 
         # Stage 2: forward operator
         B_pred = self.forward_pino.predict_B(J_i, geometry)
 
         # Stage 3: inverse encoder
-        mu, log_var = self.inverse_encoder.encode_to_latent(B_mig, geometry)
+        mu, log_var = self.inverse_encoder.encode_to_latent(B_obs, geometry)
         z = self.inverse_encoder.sample_z(mu, log_var)
 
         # Stage 4: decoder
@@ -106,11 +114,11 @@ class BPC_FNO_A(nn.Module):
         """Phase 1 training: forward path only.
 
         Args:
-            J_i: (B, 3, N, N, N)
+            J_i: (B, 3, N, N, N) or (B, 3, T, N, N, N)
             geometry: (B, 4, N, N, N)
 
         Returns:
-            B_pred: (B, N_sensors*3, T)
+            B_pred: (B, N_sensors*3) or (B, N_sensors*3, T)
         """
         return self.forward_pino.predict_B(J_i, geometry)
 
@@ -131,8 +139,8 @@ class BPC_FNO_A(nn.Module):
 
         Returns:
             dict with keys:
-            - ``J_i_mean``: (B, 3, N, N, N) — posterior mean
-            - ``J_i_std``:  (B, 3, N, N, N) — posterior std
+            - ``J_i_mean``: decoder-shaped posterior mean
+            - ``J_i_std``:  decoder-shaped posterior std
             - ``mu``:       (B, D)
             - ``log_var``:  (B, D)
         """
@@ -149,7 +157,7 @@ class BPC_FNO_A(nn.Module):
             J_i_hat = self.vae_decoder.decode(z, geometry)
             samples.append(J_i_hat)
 
-        stacked = torch.stack(samples, dim=0)  # (S, B, 3, N, N, N)
+        stacked = torch.stack(samples, dim=0)
         J_i_mean = stacked.mean(dim=0)
         J_i_std = stacked.std(dim=0) if n_samples > 1 else torch.zeros_like(J_i_mean)
 
@@ -167,7 +175,9 @@ class BPC_FNO_A(nn.Module):
     # Parameter groups for differential learning rates
     # ------------------------------------------------------------------
 
-    def get_parameter_groups(self) -> dict[str, list[nn.Parameter]]:
+    def get_parameter_groups(
+        self, lr: float | None = None
+    ) -> dict[str, list[nn.Parameter]]:
         """Return named parameter groups for the optimiser.
 
         Groups

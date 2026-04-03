@@ -262,3 +262,9 @@ All values in `configs/arch_a.yaml` match specification:
 - Model architecture verified (shared weights, 64.7M params, CUDA forward pass works)
 - Training scripts tested and working (Phase 1 completed 200 epochs on eikonal data)
 - Cloud deployment instructions written in CLOUD_DATAGEN.md
+
+## Monodomain Update
+
+MONODOMAIN STEP 0: backend-aware generator refactor PASS [clean config inheritance, eikonal/windows_hybrid/opencarp backend wiring, new HDF5 schema, Linux benchmark script, docs/runbook added]
+
+MONODOMAIN STEP 0A: local smoke verification PASS [pytest: 76 passed / 6 skipped, 1 Windows smoke sample generated successfully, smoke verifier passed 9/9 checks]

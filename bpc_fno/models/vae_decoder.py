@@ -66,8 +66,10 @@ class VAEDecoder(nn.Module, DecoderInterface):
         n_upsamples: int = config.model.get("n_decoder_upsamples", 3)
         use_bilinear: bool = config.model.get("use_bilinear_decoder", False)
         n_geometry_channels: int = config.model.get("n_geometry_channels", 4)
+        n_output_timesteps: int = int(config.model.get("n_output_timesteps", 1))
 
         self.base_ch = base_ch
+        self.n_output_timesteps = n_output_timesteps
 
         # Latent -> initial volume
         self.fc = nn.Linear(latent_dim, base_ch * 4 * 4 * 4)
@@ -84,9 +86,11 @@ class VAEDecoder(nn.Module, DecoderInterface):
                 _UpsampleBlock(channels[i], channels[i + 1], use_bilinear)
             )
 
-        # Final 1x1 conv: (last_ch + geometry_channels) -> 3
+        # Final 1x1 conv: (last_ch + geometry_channels) -> 3*T
         self.final_conv = nn.Conv3d(
-            channels[-1] + n_geometry_channels, 3, kernel_size=1
+            channels[-1] + n_geometry_channels,
+            3 * n_output_timesteps,
+            kernel_size=1,
         )
 
     def decode(self, z: Tensor, geometry: Tensor) -> Tensor:
@@ -97,9 +101,10 @@ class VAEDecoder(nn.Module, DecoderInterface):
             geometry: (B, 4, N, N, N)
 
         Returns:
-            J_i_hat: (B, 3, N, N, N) — no output activation (J_i is signed).
+            J_i_hat: (B, 3, N, N, N) if T=1, or (B, 3, T, N, N, N) if T>1.
         """
         B = z.shape[0]
+        T = self.n_output_timesteps
 
         # Project and reshape to initial volume
         x = self.fc(z)                            # (B, base_ch * 64)
@@ -107,8 +112,14 @@ class VAEDecoder(nn.Module, DecoderInterface):
 
         # Progressive upsampling: 4 -> 8 -> 16 -> 32
         for block in self.upsample_blocks:
-            x = block(x)                           # (B, 64, 32, 32, 32) after 3 blocks
+            x = block(x)                           # (B, 64, 32, 32, 32)
 
         # Concatenate geometry and produce output
         x = torch.cat([x, geometry], dim=1)        # (B, 64+4, N, N, N)
-        return self.final_conv(x)                  # (B, 3, N, N, N)
+        x = self.final_conv(x)                     # (B, 3*T, N, N, N)
+
+        if T == 1:
+            return x  # (B, 3, N, N, N) — backward compat
+        # Reshape to (B, 3, T, N, N, N)
+        _, _, N1, N2, N3 = x.shape
+        return x.view(B, 3, T, N1, N2, N3)

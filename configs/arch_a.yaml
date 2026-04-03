@@ -9,11 +9,13 @@ model:
   latent_dim: 512
   decoder_base_channels: 512
   n_decoder_upsamples: 3
+  n_sensors_total: 48
+  n_output_timesteps: 3
 
 training:
   phase1_epochs: 200
   phase2_epochs: 150
-  batch_size: 16
+  batch_size: 32
   lr_init: 1.0e-3
   lr_final: 1.0e-5
   lr_warmup_steps: 500
@@ -35,6 +37,7 @@ data:
   test_fraction: 0.1
   num_workers: 0
   pin_memory: true
+  preload_to_ram: true
 
 evaluation:
   n_uq_samples: 50

@@ -38,7 +38,7 @@ class BPCFNOTrainer(pl.LightningModule):
         - ``forward_pino`` — the forward PINO sub-module.
         - ``forward_only(J_i, geometry) -> dict`` — Phase 1 forward pass.
         - ``forward(batch) -> dict`` — Phase 2 full forward pass.
-        - ``get_parameter_groups(lr) -> list[dict]`` — optimizer param groups.
+        - ``get_parameter_groups()`` or ``get_parameter_groups(lr)`` — optimizer param groups.
         - ``get_forward_param_names() -> set[str]`` — names of forward-PINO
           parameters (used to block consistency-loss gradients).
     config:
@@ -138,6 +138,8 @@ class BPCFNOTrainer(pl.LightningModule):
         optimizer = self.optimizers()
         scheduler = self.lr_schedulers()
 
+        batch_size = batch["J_i"].shape[0]
+
         if self.phase == "forward":
             B_pred = self.model.forward_only(batch["J_i"], batch["geometry"])
             output = {"B_pred": B_pred}
@@ -193,8 +195,8 @@ class BPCFNOTrainer(pl.LightningModule):
                 value,
                 on_step=True,
                 on_epoch=True,
-                prog_bar=(key == "total_loss"),
-                batch_size=batch["B_obs"].shape[0],
+                prog_bar=(key == "total"),
+                batch_size=batch_size,
             )
 
         # Log learning rate
@@ -219,7 +221,7 @@ class BPCFNOTrainer(pl.LightningModule):
         batch_idx:
             Index of the current batch.
         """
-        batch_size = batch["B_obs"].shape[0]
+        batch_size = batch["J_i"].shape[0]
 
         if self.phase == "forward":
             B_pred = self.model.forward_only(batch["J_i"], batch["geometry"])
@@ -228,7 +230,7 @@ class BPCFNOTrainer(pl.LightningModule):
             loss_dict = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in result.items()}
 
             # Relative L2 error for forward B-field
-            B_true = batch["B_obs"]
+            B_true = self.loss_manager._get_forward_target(batch)
             l2_error = torch.norm(B_pred - B_true) / (torch.norm(B_true) + 1e-8)
             self.log(
                 "val/forward_l2",
@@ -305,7 +307,18 @@ class BPCFNOTrainer(pl.LightningModule):
 
         # Parameter groups (potentially different LRs per component)
         if hasattr(self.model, "get_parameter_groups"):
-            param_groups = self.model.get_parameter_groups(lr)
+            try:
+                raw_param_groups = self.model.get_parameter_groups()
+            except TypeError:
+                raw_param_groups = self.model.get_parameter_groups(lr)
+            if isinstance(raw_param_groups, dict):
+                param_groups = [
+                    {"params": params, "lr": lr}
+                    for params in raw_param_groups.values()
+                    if params
+                ]
+            else:
+                param_groups = raw_param_groups
         else:
             param_groups = [{"params": self.model.parameters(), "lr": lr}]
 

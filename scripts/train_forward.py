@@ -22,7 +22,8 @@ from omegaconf import DictConfig, OmegaConf
 
 from bpc_fno.data.data_module import BPCFNODataModule
 from bpc_fno.models.bpc_fno_a import BPC_FNO_A
-from bpc_fno.utils.checkpointing import save_checkpoint
+from bpc_fno.utils.checkpointing import load_checkpoint, save_checkpoint
+from bpc_fno.utils.data_paths import resolve_required_data_dir, validate_sample_data_dir
 from bpc_fno.utils.normalization import Normalizer
 
 _LOG_DIR = Path("logs")
@@ -81,31 +82,15 @@ def _build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def _create_normalizer_proxy(normalizer: Normalizer) -> object:
-    """Create a normalizer proxy that implements the protocol expected by
-    SyntheticMIGDataset (normalize/denormalize with string key)."""
-
-    class _NormalizerProxy:
-        def __init__(self, norm: Normalizer) -> None:
-            self._norm = norm
-
-        def normalize(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
-            if key == "J_i":
-                return self._norm.normalize_J_i(tensor)
-            if key in ("B_mig", "B_mig_clean"):
-                return self._norm.normalize_B(tensor)
-            if key == "geometry":
-                return self._norm.normalize_geometry(tensor)
-            return tensor  # sensor_pos and others: passthrough
-
-        def denormalize(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
-            if key == "J_i":
-                return self._norm.denormalize_J_i(tensor)
-            if key in ("B_mig", "B_mig_clean"):
-                return self._norm.denormalize_B(tensor)
-            return tensor
-
-    return _NormalizerProxy(normalizer)
+def _resolve_resume_path(
+    resume_arg: str | None, checkpoint_dir: Path, default_name: str
+) -> Path | None:
+    """Resolve ``--resume`` to an on-disk checkpoint path."""
+    if resume_arg is None:
+        return None
+    if resume_arg == "auto":
+        return checkpoint_dir / default_name
+    return Path(resume_arg)
 
 
 def main() -> None:
@@ -125,8 +110,19 @@ def main() -> None:
         help="Path to normalization statistics JSON",
     )
     parser.add_argument(
+        "--data-dir", default=None,
+        help="Synthetic data directory (required unless config.data.data_dir is set)",
+    )
+    parser.add_argument(
         "--device", default=None,
         help="Device to train on (default: auto-detect CUDA)",
+    )
+    parser.add_argument(
+        "--resume", nargs="?", const="auto", default=None,
+        help=(
+            "Resume from a checkpoint path. Pass without a value to use "
+            "<checkpoint-dir>/phase1_last.pt."
+        ),
     )
     args = parser.parse_args()
 
@@ -146,6 +142,12 @@ def main() -> None:
 
     try:
         config = OmegaConf.load(args.config)
+        checkpoint_dir = Path(args.checkpoint_dir)
+        data_dir = resolve_required_data_dir(config, args.data_dir)
+        validate_sample_data_dir(data_dir)
+        resume_path = _resolve_resume_path(
+            args.resume, checkpoint_dir, "phase1_last.pt"
+        )
 
         # ---- Device auto-detection ----
         if args.device is not None:
@@ -172,6 +174,7 @@ def main() -> None:
             steps_per_epoch,
             len(val_loader),
         )
+        logger.info("Training data directory: %s", data_dir)
 
         # ---- Create model ----
         model = BPC_FNO_A(config).to(device)
@@ -181,16 +184,71 @@ def main() -> None:
         # ---- Optimizer + cosine LR schedule with warmup ----
         optimizer = _build_optimizer(model, config)
         scheduler = _build_scheduler(optimizer, config, steps_per_epoch)
+        start_epoch = 1
 
         # ---- Training loop ----
         n_epochs: int = int(config.training.phase1_epochs)
         grad_clip: float = float(config.training.get("grad_clip_norm", 1.0))
         best_val_loss = float("inf")
+        run_meta = {
+            "n_output_timesteps": int(config.model.get("n_output_timesteps", 1)),
+            "batch_size": int(config.training.get("batch_size", 16)),
+        }
+
+        if resume_path is not None:
+            if not resume_path.exists():
+                logger.error("Resume checkpoint not found: %s", resume_path)
+                sys.exit(1)
+            ckpt_meta = load_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                path=resume_path,
+                strict=True,
+            )
+            if ckpt_meta["phase"] != "forward":
+                logger.error(
+                    "Resume checkpoint phase mismatch: expected 'forward', got '%s'",
+                    ckpt_meta["phase"],
+                )
+                sys.exit(1)
+            start_epoch = int(ckpt_meta["epoch"]) + 1
+            best_val_loss = float(
+                ckpt_meta["extra_state"].get(
+                    "best_val_loss",
+                    ckpt_meta["metrics"].get("best_val_loss", float("inf")),
+                )
+            )
+            logger.info(
+                "Resuming Phase 1 from %s at epoch %d (best_val_loss=%.6f)",
+                resume_path,
+                start_epoch,
+                best_val_loss,
+            )
+        else:
+            existing_phase_ckpts = sorted(checkpoint_dir.glob("phase1_*.pt"))
+            if existing_phase_ckpts:
+                logger.warning(
+                    "Starting a fresh Phase 1 run in %s, which already contains "
+                    "%d phase1 checkpoint(s). Use --resume or a different "
+                    "--checkpoint-dir to avoid overwriting prior results.",
+                    checkpoint_dir,
+                    len(existing_phase_ckpts),
+                )
 
         logger.info("Starting Phase 1 training for %d epochs...", n_epochs)
         t0 = time.monotonic()
 
-        for epoch in range(1, n_epochs + 1):
+        if start_epoch > n_epochs:
+            logger.info(
+                "Checkpoint epoch exceeds configured phase1_epochs "
+                "(start_epoch=%d, phase1_epochs=%d); nothing to do.",
+                start_epoch,
+                n_epochs,
+            )
+            return
+
+        for epoch in range(start_epoch, n_epochs + 1):
             # --- Train ---
             model.train()
             epoch_loss = 0.0
@@ -203,6 +261,11 @@ def main() -> None:
 
                 B_pred = model.forward_only(J_i, geometry)
                 loss = F.mse_loss(B_pred, B_target)
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite Phase 1 loss at epoch {epoch}, "
+                        f"train batch {n_batches + 1}: {float(loss.detach().cpu())}"
+                    )
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -228,6 +291,11 @@ def main() -> None:
 
                     B_pred = model.forward_only(J_i, geometry)
                     loss = F.mse_loss(B_pred, B_target)
+                    if not torch.isfinite(loss):
+                        raise RuntimeError(
+                            f"Non-finite Phase 1 validation loss at epoch {epoch}, "
+                            f"val batch {n_val + 1}: {float(loss.detach().cpu())}"
+                        )
                     val_loss += loss.item()
                     n_val += 1
 
@@ -242,31 +310,55 @@ def main() -> None:
             # Save best checkpoint.
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                ckpt_path = Path(args.checkpoint_dir) / "phase1_best.pt"
+                ckpt_path = checkpoint_dir / "phase1_best.pt"
                 save_checkpoint(
                     model=model,
                     optimizer=optimizer,
+                    scheduler=scheduler,
                     epoch=epoch,
                     phase="forward",
                     metrics={
                         "train_loss": avg_train_loss,
                         "val_loss": avg_val_loss,
+                        "best_val_loss": best_val_loss,
+                        **run_meta,
                     },
+                    extra_state={"best_val_loss": best_val_loss},
                     path=ckpt_path,
                 )
 
+            last_path = checkpoint_dir / "phase1_last.pt"
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                phase="forward",
+                metrics={
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss,
+                    "best_val_loss": best_val_loss,
+                    **run_meta,
+                },
+                extra_state={"best_val_loss": best_val_loss},
+                path=last_path,
+            )
+
         # Save final checkpoint.
-        final_path = Path(args.checkpoint_dir) / "phase1_final.pt"
+        final_path = checkpoint_dir / "phase1_final.pt"
         save_checkpoint(
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
             epoch=n_epochs,
             phase="forward",
             metrics={
                 "train_loss": avg_train_loss,
                 "val_loss": avg_val_loss,
                 "best_val_loss": best_val_loss,
+                **run_meta,
             },
+            extra_state={"best_val_loss": best_val_loss},
             path=final_path,
         )
 

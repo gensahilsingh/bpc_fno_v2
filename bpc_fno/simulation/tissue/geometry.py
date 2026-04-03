@@ -30,8 +30,10 @@ class VentricularSlab:
 
     Parameters
     ----------
-    grid_size : int
-        Number of voxels along each axis (*N*).  Default 32.
+    grid_size : int | tuple[int, int, int]
+        Number of voxels along each axis. Passing an integer creates a cubic
+        slab ``(N, N, N)`` for backward compatibility; passing a 3-tuple
+        creates a rectangular slab ``(Nx, Ny, Nz)``.
     voxel_size_cm : float
         Edge length of each cubic voxel in centimetres.  Default 0.05 cm
         (500 um).
@@ -46,11 +48,27 @@ class VentricularSlab:
 
     def __init__(
         self,
-        grid_size: int = 32,
+        grid_size: int | tuple[int, int, int] = 32,
         voxel_size_cm: float = 0.05,
         layer_fractions: list[float] | None = None,
     ) -> None:
-        self.grid_size: int = grid_size
+        if isinstance(grid_size, (int, np.integer)):
+            size = int(grid_size)
+            self.grid_size: int | tuple[int, int, int] = size
+            self.grid_shape: tuple[int, int, int] = (size, size, size)
+        else:
+            if len(grid_size) != 3:
+                raise ValueError(
+                    "grid_size tuple must have exactly 3 entries (Nx, Ny, Nz)."
+                )
+            self.grid_shape = tuple(int(v) for v in grid_size)
+            if any(v <= 0 for v in self.grid_shape):
+                raise ValueError(
+                    f"grid_size entries must be positive, got {self.grid_shape}."
+                )
+            self.grid_size = self.grid_shape
+
+        self.nx, self.ny, self.nz = self.grid_shape
         self.voxel_size_cm: float = voxel_size_cm
         self.layer_fractions: list[float] = (
             layer_fractions if layer_fractions is not None else [0.33, 0.33, 0.34]
@@ -62,7 +80,9 @@ class VentricularSlab:
             raise ValueError(f"layer_fractions must sum to 1.0, got {sum(self.layer_fractions):.6f}.")
 
         # Physical dimensions (cm)
-        self.physical_size_cm: float = grid_size * voxel_size_cm
+        self.physical_size_cm: tuple[float, float, float] = tuple(
+            dim * voxel_size_cm for dim in self.grid_shape
+        )
 
     # ------------------------------------------------------------------
     # Fiber orientation
@@ -83,14 +103,14 @@ class VentricularSlab:
         np.ndarray
             Shape ``(N, N, N, 3)`` float64 — unit fibre vectors.
         """
-        N = self.grid_size
+        nx, ny, nz = self.grid_shape
 
         # Transmural fractional coordinate for each x-index
-        x_idx = np.arange(N, dtype=np.float64)
-        angle_deg = self._ENDO_ANGLE_DEG + (self._EPI_ANGLE_DEG - self._ENDO_ANGLE_DEG) * x_idx / max(N - 1, 1)
+        x_idx = np.arange(nx, dtype=np.float64)
+        angle_deg = self._ENDO_ANGLE_DEG + (self._EPI_ANGLE_DEG - self._ENDO_ANGLE_DEG) * x_idx / max(nx - 1, 1)
         angle_rad = np.deg2rad(angle_deg)  # shape (N,)
 
-        fiber = np.zeros((N, N, N, 3), dtype=np.float64)
+        fiber = np.zeros((nx, ny, nz, 3), dtype=np.float64)
         # Broadcast angle across y and z axes
         fiber[:, :, :, 0] = 0.0
         fiber[:, :, :, 1] = np.sin(angle_rad)[:, None, None]
@@ -115,10 +135,10 @@ class VentricularSlab:
         np.ndarray
             Shape ``(N, N, N)`` float64 — signed distance in cm.
         """
-        N = self.grid_size
-        x_idx = np.arange(N, dtype=np.float64)
-        dist_from_wall = np.minimum(x_idx, (N - 1) - x_idx) * self.voxel_size_cm  # (N,)
-        sdf = np.broadcast_to(dist_from_wall[:, None, None], (N, N, N)).copy()
+        nx, ny, nz = self.grid_shape
+        x_idx = np.arange(nx, dtype=np.float64)
+        dist_from_wall = np.minimum(x_idx, (nx - 1) - x_idx) * self.voxel_size_cm
+        sdf = np.broadcast_to(dist_from_wall[:, None, None], (nx, ny, nz)).copy()
         return sdf
 
     # ------------------------------------------------------------------
@@ -137,14 +157,14 @@ class VentricularSlab:
         np.ndarray
             Shape ``(N, N, N)`` int8.
         """
-        N = self.grid_size
-        endo_end = N * self.layer_fractions[0]
-        mid_end = N * (self.layer_fractions[0] + self.layer_fractions[1])
+        nx, ny, nz = self.grid_shape
+        endo_end = nx * self.layer_fractions[0]
+        mid_end = nx * (self.layer_fractions[0] + self.layer_fractions[1])
 
-        x_idx = np.arange(N, dtype=np.float64)
+        x_idx = np.arange(nx, dtype=np.float64)
         layer_1d = np.where(x_idx < endo_end, 0, np.where(x_idx < mid_end, 1, 2)).astype(np.int8)
 
-        cell_map = np.broadcast_to(layer_1d[:, None, None], (N, N, N)).copy()
+        cell_map = np.broadcast_to(layer_1d[:, None, None], (nx, ny, nz)).copy()
         return cell_map
 
     # ------------------------------------------------------------------
@@ -202,18 +222,18 @@ class VentricularSlab:
         np.ndarray
             Shape ``(N, N, N)`` bool — *True* where tissue is fibrotic.
         """
-        N = self.grid_size
-        n_centres = max(1, int(density * N))
+        nx, ny, nz = self.grid_shape
+        n_centres = max(1, int(density * nx))
 
         # Coordinate grids (voxel indices)
-        coords = np.mgrid[0:N, 0:N, 0:N].astype(np.float64)  # (3, N, N, N)
+        coords = np.mgrid[0:nx, 0:ny, 0:nz].astype(np.float64)
 
-        accumulator = np.zeros((N, N, N), dtype=np.float64)
+        accumulator = np.zeros((nx, ny, nz), dtype=np.float64)
 
         for _ in range(n_centres):
-            cx = rng.integers(0, N)
-            cy = rng.integers(0, N)
-            cz = rng.integers(0, N)
+            cx = rng.integers(0, nx)
+            cy = rng.integers(0, ny)
+            cz = rng.integers(0, nz)
             dist_sq = (
                 (coords[0] - cx) ** 2
                 + (coords[1] - cy) ** 2

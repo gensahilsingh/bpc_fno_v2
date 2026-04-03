@@ -13,11 +13,14 @@ logger = logging.getLogger(__name__)
 
 def save_checkpoint(
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None,
     epoch: int,
     phase: str,
     metrics: dict[str, Any],
     path: str | Path,
+    *,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    extra_state: dict[str, Any] | None = None,
 ) -> None:
     """Save a training checkpoint to disk.
 
@@ -26,7 +29,7 @@ def save_checkpoint(
     model:
         The model whose ``state_dict`` will be saved.
     optimizer:
-        The optimizer whose ``state_dict`` will be saved.
+        Optional optimizer whose ``state_dict`` will be saved.
     epoch:
         Current epoch number.
     phase:
@@ -46,14 +49,21 @@ def save_checkpoint(
 
     payload: dict[str, Any] = {
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
         "phase": phase,
         "metrics": metrics,
         "parameter_names": sorted(model.state_dict().keys()),
     }
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    if extra_state is not None:
+        payload["extra_state"] = extra_state
 
-    torch.save(payload, path)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
     logger.info(
         "Checkpoint saved: epoch=%d phase=%s path=%s", epoch, phase, path
     )
@@ -64,6 +74,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None,
     path: str | Path,
     *,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     strict: bool = True,
 ) -> dict[str, Any]:
     """Load a checkpoint and restore model / optimizer state.
@@ -115,11 +126,19 @@ def load_checkpoint(
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    elif optimizer is not None:
+        logger.warning("Checkpoint has no optimizer state: %s", path)
+
+    if scheduler is not None and "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    elif scheduler is not None:
+        logger.warning("Checkpoint has no scheduler state: %s", path)
 
     meta = {
         "epoch": checkpoint.get("epoch", 0),
         "phase": checkpoint.get("phase", "unknown"),
         "metrics": checkpoint.get("metrics", {}),
+        "extra_state": checkpoint.get("extra_state", {}),
     }
     logger.info(
         "Checkpoint loaded: epoch=%d phase=%s path=%s",
@@ -158,6 +177,9 @@ def validate_checkpoint(path: str | Path) -> dict[str, Any]:
         "metrics": checkpoint.get("metrics", {}),
         "parameter_names": param_names,
         "num_parameters": total_params,
+        "has_optimizer_state": "optimizer_state_dict" in checkpoint,
+        "has_scheduler_state": "scheduler_state_dict" in checkpoint,
+        "extra_state": checkpoint.get("extra_state", {}),
     }
     logger.info(
         "Checkpoint validated: epoch=%d phase=%s params=%d path=%s",
